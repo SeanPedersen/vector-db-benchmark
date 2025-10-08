@@ -143,8 +143,8 @@ def main():
     else:
         lists = int(num_vectors ** 0.5)
 
-    # Calculate probes based on lists (sqrt(lists) as starting point, cap at lists)
-    probes = min(int(lists ** 0.5) * 6, lists)
+    # Calculate probes: recommended value is sqrt(lists)
+    probes = int(lists ** 0.5)
 
     print(f"Creating IVFFlat index with lists={lists} (probes will be {probes})...")
     index_start = time.time()
@@ -175,30 +175,30 @@ def main():
     conn.commit()
 
     # Calculate optimal DiskANN parameters based on dataset size
+    # Note: memory_optimized uses SBQ compression for better storage efficiency and I/O performance
     if num_vectors < 1_000:
         print("Warning: DiskANN requires at least 1,000 vectors for optimal performance")
         num_neighbors = 32
         search_list_size = 50
         max_alpha = 1.0
-        storage_layout = 'memory_optimized'
     elif num_vectors < 1_000_000:
         # Small to Medium (1K-1M)
         num_neighbors = 50
         search_list_size = 100
         max_alpha = 1.0
-        storage_layout = 'memory_optimized'
     elif num_vectors < 100_000_000:
         # Large (1M-100M)
         num_neighbors = 100
         search_list_size = 200
         max_alpha = 1.2
-        storage_layout = 'disk_optimized'
     else:
         # Very Large (>100M)
         num_neighbors = 200
         search_list_size = 500
         max_alpha = 1.5
-        storage_layout = 'disk_optimized'
+
+    # Use memory_optimized (SBQ compression) for all dataset sizes - best balance of storage & performance
+    storage_layout = 'memory_optimized'
 
     print(f"Creating DiskANN index with optimized parameters:")
     print(f"  num_neighbors={num_neighbors}, search_list_size={search_list_size}")
