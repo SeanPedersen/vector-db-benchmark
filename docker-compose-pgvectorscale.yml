@@ -6,7 +6,7 @@ services:
       "-c", "shared_buffers=4GB",
       "-c", "effective_cache_size=8GB",
       "-c", "work_mem=16MB",
-      "-c", "maintenance_work_mem=1GB"
+      "-c", "maintenance_work_mem=2GB"
     ]
     environment:
       POSTGRES_USER: postgres
