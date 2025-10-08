@@ -40,15 +40,8 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
     start_time = time.time()
 
     if index_type == "DiskANN":
-        if diskann_params:
-            query_search_list = diskann_params.get('search_list_size', 200)
-            query_rescore = max(1000, diskann_params.get('num_neighbors', 100) * 10)
-            print(f"Setting DiskANN query parameters: search_list={query_search_list}, rescore={query_rescore}")
-            cursor.execute(f"SET diskann.query_search_list_size = {query_search_list}")
-            cursor.execute(f"SET diskann.query_rescore = {query_rescore}")
-        else:
-            print("Setting default DiskANN query parameters...")
-            cursor.execute("SET diskann.query_rescore = 1000")
+        # Use default query parameters (no custom settings needed)
+        pass
     elif index_type == "IVFFlat":
         probes_value = probes if probes is not None else 200
         print(f"Setting optimized IVFFlat query parameters (probes={probes_value})...")
