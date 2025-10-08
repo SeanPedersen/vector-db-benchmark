@@ -2,13 +2,20 @@
 """Generate random vectors and query for ANN benchmark."""
 
 import numpy as np
+import argparse
 
 # Configuration
-NUM_VECTORS = 100_000
 DIMENSIONS = 512
 K_NEIGHBORS = 100
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate random vectors for ANN benchmark")
+    parser.add_argument('--num-vectors', type=int, default=100000,
+                        help='Number of vectors to generate (default: 100000)')
+    args = parser.parse_args()
+
+    NUM_VECTORS = args.num_vectors
+
     print(f"Generating {NUM_VECTORS:,} random vectors of dimension {DIMENSIONS}...")
 
     # Set seed for reproducibility

@@ -33,12 +33,11 @@ def main():
     print(f"\nTop {K_NEIGHBORS} nearest neighbors (IDs):")
     print(top_k_ids)
 
-    # Save baseline results
+    # Save baseline results (for query scripts to compare)
     print("\nSaving baseline results...")
     np.save('baseline_ids.npy', top_k_ids)
-    np.save('baseline_similarities.npy', top_k_similarities)
 
-    print(f"\nBaseline saved to baseline_ids.npy and baseline_similarities.npy")
+    print(f"\nBaseline saved to baseline_ids.npy")
     print(f"Query latency: {elapsed:.3f} seconds ({elapsed*1000:.2f} ms)")
 
 if __name__ == "__main__":

@@ -51,24 +51,35 @@ def main():
                         help='Skip vectorchord benchmark')
     parser.add_argument('--skip-insertion', action='store_true',
                         help='Skip data insertion (run queries only)')
+    parser.add_argument('--num-vectors', type=int, default=100000,
+                        help='Number of vectors to generate and benchmark (default: 100000)')
     args = parser.parse_args()
 
     print("ANN BENCHMARK - pgvectorscale vs vectorchord")
     print("="*60)
 
     # Step 1: Generate data
+    regenerate_data = False
     if not os.path.exists('vectors.npy'):
-        print("\nStep 1: Generating random vectors...")
-        run_command("python3 generate_data.py", "Data generation")
+        regenerate_data = True
     else:
-        print("\nStep 1: Using existing vectors.npy")
+        # Check if existing vectors.npy has the correct size
+        import numpy as np
+        existing_vectors = np.load('vectors.npy')
+        if len(existing_vectors) != args.num_vectors:
+            print(f"\nStep 1: Existing vectors.npy has {len(existing_vectors):,} vectors, but {args.num_vectors:,} requested.")
+            print("Regenerating data...")
+            regenerate_data = True
+        else:
+            print("\nStep 1: Using existing vectors.npy")
+
+    if regenerate_data:
+        print(f"\nStep 1: Generating {args.num_vectors:,} random vectors...")
+        run_command(f"python3 generate_data.py --num-vectors {args.num_vectors}", "Data generation")
 
     # Step 2: Compute baseline
-    if not os.path.exists('baseline_ids.npy'):
-        print("\nStep 2: Computing exact baseline...")
-        run_command("python3 compute_baseline.py", "Baseline computation")
-    else:
-        print("\nStep 2: Using existing baseline_ids.npy")
+    print("\nStep 2: Computing exact baseline...")
+    run_command("python3 compute_baseline.py", "Baseline computation")
 
     # Step 3: Test pgvectorscale
     if not args.skip_pgvectorscale:
