@@ -23,18 +23,10 @@ def compute_precision(retrieved_ids, baseline_ids):
     precision = len(intersection) / len(baseline_ids)
     return precision
 
-def main():
-    print("Loading query vector and baseline...")
-    query = np.load('query.npy')
-    baseline_ids = np.load('baseline_ids.npy')
-
-    print("Connecting to vectorchord database...")
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-
+def benchmark_index(cursor, index_name, query_str, baseline_ids, baseline_time, db_size, table_size):
+    """Run benchmark for a specific index."""
     # Warm-up query
     print("Running warm-up query...")
-    query_str = '[' + ','.join(map(str, query)) + ']'
     cursor.execute(f"""
         SELECT id
         FROM vectors
@@ -44,7 +36,7 @@ def main():
     cursor.fetchall()
 
     # Actual benchmark query
-    print(f"\nQuerying for {K_NEIGHBORS} nearest neighbors...")
+    print(f"Querying for {K_NEIGHBORS} nearest neighbors...")
     start_time = time.time()
 
     cursor.execute(f"""
@@ -63,22 +55,14 @@ def main():
     # Compute precision
     precision = compute_precision(retrieved_ids, baseline_ids)
 
-    # Get database stats
-    cursor.execute("SELECT pg_size_pretty(pg_database_size(current_database()))")
-    db_size = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT pg_size_pretty(pg_total_relation_size('vectors'))
-    """)
-    table_size = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT pg_size_pretty(pg_total_relation_size('idx_vectors_embedding_vchordrq'))
+    # Get index size
+    cursor.execute(f"""
+        SELECT pg_size_pretty(pg_total_relation_size('{index_name}'))
     """)
     index_size = cursor.fetchone()[0]
 
     print("\n" + "="*60)
-    print("VECTORCHORD (vchordrq) BENCHMARK RESULTS")
+    print(f"VECTORCHORD ({index_name}) BENCHMARK RESULTS")
     print("="*60)
     print(f"Query latency:        {query_latency*1000:.2f} ms")
     print(f"Retrieval precision:  {precision*100:.2f}% ({int(precision*K_NEIGHBORS)}/{K_NEIGHBORS} matches)")
@@ -89,6 +73,97 @@ def main():
 
     print(f"\nTop 10 retrieved IDs: {retrieved_ids[:10].tolist()}")
     print(f"Top 10 baseline IDs:  {baseline_ids[:10].tolist()}")
+
+    print("\n" + "="*60)
+    print("BASELINE (Brute Force) PERFORMANCE")
+    print("="*60)
+    print(f"Query latency:        {baseline_time*1000:.2f} ms")
+    print(f"Speedup:              {baseline_time/query_latency:.2f}x faster")
+    print("="*60)
+
+def main():
+    print("Loading query vector and baseline...")
+    query = np.load('query.npy')
+    baseline_ids = np.load('baseline_ids.npy')
+    vectors = np.load('vectors.npy')
+
+    # Compute baseline (brute force) query time
+    print("\nComputing baseline (brute force) query time...")
+    baseline_start = time.time()
+    similarities = np.dot(vectors, query)
+    top_k_indices = np.argsort(similarities)[::-1][:K_NEIGHBORS]
+    baseline_time = time.time() - baseline_start
+    print(f"Baseline query time: {baseline_time*1000:.2f} ms")
+
+    print("\nConnecting to vectorchord database...")
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    query_str = '[' + ','.join(map(str, query)) + ']'
+
+    # Get database stats (shared)
+    cursor.execute("SELECT pg_size_pretty(pg_database_size(current_database()))")
+    db_size = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT pg_size_pretty(pg_total_relation_size('vectors'))
+    """)
+    table_size = cursor.fetchone()[0]
+
+    # Test 1: Default index
+    print("\n" + "="*60)
+    print("TESTING DEFAULT INDEX")
+    print("="*60)
+
+    # Drop and recreate default index
+    print("Dropping default index if it exists...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordrq_default")
+    conn.commit()
+
+    print("Creating default index...")
+    index_start = time.time()
+    cursor.execute("""
+        CREATE INDEX idx_vectors_embedding_vchordrq_default
+        ON vectors USING vchordrq (embedding vector_cosine_ops)
+    """)
+    conn.commit()
+    index_time = time.time() - index_start
+    print(f"Default index created in {index_time:.2f} seconds")
+
+    benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_default',
+                   query_str, baseline_ids, baseline_time, db_size, table_size)
+
+    # Drop default index and create optimized one
+    print("\n" + "="*60)
+    print("SWITCHING TO OPTIMIZED INDEX")
+    print("="*60)
+
+    print("Dropping optimized index if it exists...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordrq_optimized")
+    conn.commit()
+
+    print("\nCreating optimized vchordrq index with residual quantization...")
+    index_start = time.time()
+    cursor.execute("""
+        CREATE INDEX idx_vectors_embedding_vchordrq_optimized
+        ON vectors USING vchordrq (embedding vector_cosine_ops) WITH (options = $$
+residual_quantization = true
+build.pin = true
+[build.internal]
+spherical_centroids = true
+build_threads = 8
+$$)
+    """)
+    conn.commit()
+    index_time = time.time() - index_start
+    print(f"Optimized index created in {index_time:.2f} seconds")
+
+    # Test 2: Optimized index
+    print("\n" + "="*60)
+    print("TESTING OPTIMIZED INDEX")
+    print("="*60)
+    benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_optimized',
+                   query_str, baseline_ids, baseline_time, db_size, table_size)
 
     cursor.close()
     conn.close()

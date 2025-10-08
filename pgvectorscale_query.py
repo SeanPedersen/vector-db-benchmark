@@ -27,10 +27,37 @@ def main():
     print("Loading query vector and baseline...")
     query = np.load('query.npy')
     baseline_ids = np.load('baseline_ids.npy')
+    vectors = np.load('vectors.npy')
 
-    print("Connecting to pgvectorscale database...")
+    # Compute baseline (brute force) query time
+    print("\nComputing baseline (brute force) query time...")
+    baseline_start = time.time()
+    similarities = np.dot(vectors, query)
+    top_k_indices = np.argsort(similarities)[::-1][:K_NEIGHBORS]
+    baseline_time = time.time() - baseline_start
+    print(f"Baseline query time: {baseline_time*1000:.2f} ms")
+
+    print("\nConnecting to pgvectorscale database...")
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
+
+    # Check if index exists, create if missing
+    cursor.execute("""
+        SELECT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE indexname = 'idx_vectors_embedding_diskann'
+        )
+    """)
+    if not cursor.fetchone()[0]:
+        print("DiskANN index not found. Creating...")
+        index_start = time.time()
+        cursor.execute("""
+            CREATE INDEX idx_vectors_embedding_diskann
+            ON vectors USING diskann (embedding vector_cosine_ops)
+        """)
+        conn.commit()
+        index_time = time.time() - index_start
+        print(f"DiskANN index created in {index_time:.2f} seconds\n")
 
     # Warm-up query
     print("Running warm-up query...")
@@ -89,6 +116,13 @@ def main():
 
     print(f"\nTop 10 retrieved IDs: {retrieved_ids[:10].tolist()}")
     print(f"Top 10 baseline IDs:  {baseline_ids[:10].tolist()}")
+
+    print("\n" + "="*60)
+    print("BASELINE (Brute Force) PERFORMANCE")
+    print("="*60)
+    print(f"Query latency:        {baseline_time*1000:.2f} ms")
+    print(f"Speedup:              {baseline_time/query_latency:.2f}x faster")
+    print("="*60)
 
     cursor.close()
     conn.close()

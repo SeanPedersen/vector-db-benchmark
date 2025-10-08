@@ -39,7 +39,7 @@ def main():
     np.save('baseline_similarities.npy', top_k_similarities)
 
     print(f"\nBaseline saved to baseline_ids.npy and baseline_similarities.npy")
-    print(f"Query latency: {elapsed:.3f} seconds")
+    print(f"Query latency: {elapsed:.3f} seconds ({elapsed*1000:.2f} ms)")
 
 if __name__ == "__main__":
     main()

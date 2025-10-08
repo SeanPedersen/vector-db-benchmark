@@ -66,16 +66,16 @@ def main():
     print(f"  Total time: {elapsed:.2f} seconds")
     print(f"  Throughput: {count / elapsed:.0f} vectors/second")
 
-    # Create index after insertion
-    print("\nCreating vchordrq index...")
+    # Create default index after insertion
+    print("\nCreating default vchordrq index...")
     index_start = time.time()
     cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_vectors_embedding_vchordrq
+        CREATE INDEX IF NOT EXISTS idx_vectors_embedding_vchordrq_default
         ON vectors USING vchordrq (embedding vector_cosine_ops)
     """)
     conn.commit()
     index_time = time.time() - index_start
-    print(f"Index created in {index_time:.2f} seconds")
+    print(f"Default index created in {index_time:.2f} seconds")
 
     cursor.close()
     conn.close()

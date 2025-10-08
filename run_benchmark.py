@@ -49,6 +49,8 @@ def main():
                         help='Skip pgvectorscale benchmark')
     parser.add_argument('--skip-vectorchord', action='store_true',
                         help='Skip vectorchord benchmark')
+    parser.add_argument('--skip-insertion', action='store_true',
+                        help='Skip data insertion (run queries only)')
     args = parser.parse_args()
 
     print("ANN BENCHMARK - pgvectorscale vs vectorchord")
@@ -83,8 +85,11 @@ def main():
             print("Error: Database failed to start")
             sys.exit(1)
 
-        print("\nInserting vectors into pgvectorscale...")
-        run_command("python3 pgvectorscale_insert.py", "pgvectorscale insertion")
+        if not args.skip_insertion:
+            print("\nInserting vectors into pgvectorscale...")
+            run_command("python3 pgvectorscale_insert.py", "pgvectorscale insertion")
+        else:
+            print("\nSkipping insertion (--skip-insertion)")
 
         print("\nQuerying pgvectorscale...")
         run_command("python3 pgvectorscale_query.py", "pgvectorscale query")
@@ -112,8 +117,11 @@ def main():
             print("Error: Database failed to start")
             sys.exit(1)
 
-        print("\nInserting vectors into vectorchord...")
-        run_command("python3 vectorchord_insert.py", "vectorchord insertion")
+        if not args.skip_insertion:
+            print("\nInserting vectors into vectorchord...")
+            run_command("python3 vectorchord_insert.py", "vectorchord insertion")
+        else:
+            print("\nSkipping insertion (--skip-insertion)")
 
         print("\nQuerying vectorchord...")
         run_command("python3 vectorchord_query.py", "vectorchord query")
