@@ -43,6 +43,28 @@ def wait_for_db(max_attempts=30, delay=2):
                 return False
     return False
 
+def check_table_count(expected_count):
+    """Check if the vectors table has the expected number of rows."""
+    db_config = {
+        'host': 'localhost',
+        'port': 5432,
+        'dbname': 'postgres',
+        'user': 'postgres',
+        'password': 'postgres'
+    }
+
+    try:
+        conn = psycopg2.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM vectors")
+        count = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        return count == expected_count
+    except Exception as e:
+        print(f"Error checking table count: {e}")
+        return False
+
 def main():
     parser = argparse.ArgumentParser(description="ANN Benchmark - pgvectorscale vs vectorchord")
     parser.add_argument('--skip-pgvectorscale', action='store_true',
@@ -81,45 +103,13 @@ def main():
     print("\nStep 2: Computing exact baseline...")
     run_command("python3 compute_baseline.py", "Baseline computation")
 
-    # Step 3: Test pgvectorscale
-    if not args.skip_pgvectorscale:
-        print("\n" + "="*60)
-        print("TESTING PGVECTORSCALE (DiskANN)")
-        print("="*60)
-
-        print("\nStarting pgvectorscale container...")
-        run_command("docker compose -f docker-compose-pgvectorscale.yml up -d",
-                    "Start pgvectorscale")
-
-        print("\nWaiting for database to be ready...")
-        if not wait_for_db():
-            print("Error: Database failed to start")
-            sys.exit(1)
-
-        if not args.skip_insertion:
-            print("\nInserting vectors into pgvectorscale...")
-            run_command("python3 pgvectorscale_insert.py", "pgvectorscale insertion")
-        else:
-            print("\nSkipping insertion (--skip-insertion)")
-
-        print("\nQuerying pgvectorscale...")
-        run_command("python3 pgvectorscale_query.py", "pgvectorscale query")
-
-        print("\nStopping pgvectorscale container...")
-        run_command("docker compose -f docker-compose-pgvectorscale.yml down",
-                    "Stop pgvectorscale")
-    else:
-        print("\n" + "="*60)
-        print("SKIPPING PGVECTORSCALE (--skip-pgvectorscale)")
-        print("="*60)
-
-    # Step 4: Test vectorchord
+    # Step 3: Test vectorchord
     if not args.skip_vectorchord:
         print("\n" + "="*60)
         print("TESTING VECTORCHORD (vchordrq)")
         print("="*60)
 
-        print("\nStarting vectorchord container...")
+        print("\nStarting vectorchord container (or using existing)...")
         run_command("docker compose -f docker-compose-vectorchord.yml up -d",
                     "Start vectorchord")
 
@@ -129,20 +119,60 @@ def main():
             sys.exit(1)
 
         if not args.skip_insertion:
-            print("\nInserting vectors into vectorchord...")
-            run_command("python3 vectorchord_insert.py", "vectorchord insertion")
+            # Check if table already has the correct number of vectors
+            if check_table_count(args.num_vectors):
+                print(f"\nTable already contains {args.num_vectors:,} vectors. Skipping insertion.")
+            else:
+                print("\nInserting vectors into vectorchord...")
+                run_command("python3 vectorchord_insert.py", "vectorchord insertion")
         else:
             print("\nSkipping insertion (--skip-insertion)")
 
         print("\nQuerying vectorchord...")
         run_command("python3 vectorchord_query.py", "vectorchord query")
 
-        print("\nStopping vectorchord container...")
-        run_command("docker compose -f docker-compose-vectorchord.yml down",
+        print("\nStopping vectorchord container (keeping data)...")
+        run_command("docker compose -f docker-compose-vectorchord.yml stop",
                     "Stop vectorchord")
     else:
         print("\n" + "="*60)
         print("SKIPPING VECTORCHORD (--skip-vectorchord)")
+        print("="*60)
+
+    # Step 4: Test pgvectorscale
+    if not args.skip_pgvectorscale:
+        print("\n" + "="*60)
+        print("TESTING PGVECTORSCALE (IVFFlat & DiskANN)")
+        print("="*60)
+
+        print("\nStarting pgvectorscale container (or using existing)...")
+        run_command("docker compose -f docker-compose-pgvectorscale.yml up -d",
+                    "Start pgvectorscale")
+
+        print("\nWaiting for database to be ready...")
+        if not wait_for_db():
+            print("Error: Database failed to start")
+            sys.exit(1)
+
+        if not args.skip_insertion:
+            # Check if table already has the correct number of vectors
+            if check_table_count(args.num_vectors):
+                print(f"\nTable already contains {args.num_vectors:,} vectors. Skipping insertion.")
+            else:
+                print("\nInserting vectors into pgvectorscale...")
+                run_command("python3 pgvectorscale_insert.py", "pgvectorscale insertion")
+        else:
+            print("\nSkipping insertion (--skip-insertion)")
+
+        print("\nQuerying pgvectorscale...")
+        run_command("python3 pgvectorscale_query.py", "pgvectorscale query")
+
+        print("\nStopping pgvectorscale container (keeping data)...")
+        run_command("docker compose -f docker-compose-pgvectorscale.yml stop",
+                    "Stop pgvectorscale")
+    else:
+        print("\n" + "="*60)
+        print("SKIPPING PGVECTORSCALE (--skip-pgvectorscale)")
         print("="*60)
 
     print("\n" + "="*60)
@@ -150,10 +180,10 @@ def main():
     print("="*60)
 
     tested_systems = []
-    if not args.skip_pgvectorscale:
-        tested_systems.append("pgvectorscale")
     if not args.skip_vectorchord:
         tested_systems.append("vectorchord")
+    if not args.skip_pgvectorscale:
+        tested_systems.append("pgvectorscale")
 
     if tested_systems:
         print(f"\nTested systems: {', '.join(tested_systems)}. Check the output above for results.")

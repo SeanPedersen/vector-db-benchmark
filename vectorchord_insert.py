@@ -28,10 +28,22 @@ def main():
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
-    # Clear existing data
-    print("Clearing existing data...")
-    cursor.execute("TRUNCATE TABLE vectors")
-    conn.commit()
+    # Check if table already has the correct number of vectors
+    cursor.execute("SELECT COUNT(*) FROM vectors")
+    existing_count = cursor.fetchone()[0]
+    print(f"Existing vector count in database: {existing_count:,}")
+
+    if existing_count == len(vectors):
+        print(f"Table already contains {existing_count:,} vectors (matches dataset size). Skipping insertion.")
+        cursor.close()
+        conn.close()
+        return
+
+    # Clear existing data if count doesn't match
+    if existing_count > 0:
+        print(f"Clearing existing data ({existing_count:,} vectors)...")
+        cursor.execute("TRUNCATE TABLE vectors")
+        conn.commit()
 
     print(f"\nInserting {len(vectors):,} vectors in batches of {BATCH_SIZE:,}...")
     start_time = time.time()

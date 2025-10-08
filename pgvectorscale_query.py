@@ -23,7 +23,7 @@ def compute_precision(retrieved_ids, baseline_ids):
     precision = len(intersection) / len(baseline_ids)
     return precision
 
-def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size):
+def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size, probes=None):
     """Run benchmark for a specific index."""
     # Warm-up query
     print("Running warm-up query...")
@@ -41,9 +41,12 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
 
     if index_type == "DiskANN":
         print("Setting optimized DiskANN query parameters...")
-        cursor.execute("BEGIN;")
-        cursor.execute("SET LOCAL diskann.query_rescore = 1000;")
-        cursor.execute("SET LOCAL diskann.l_value_is = 500;")
+        cursor.execute("SET diskann.query_rescore = 1000")
+        cursor.execute("SET diskann.l_value_is = 500")
+    elif index_type == "IVFFlat":
+        probes_value = probes if probes is not None else 200
+        print(f"Setting optimized IVFFlat query parameters (probes={probes_value})...")
+        cursor.execute(f"SET ivfflat.probes = {probes_value}")
 
     cursor.execute(f"""
         SELECT id, embedding <=> %s::vector as distance
@@ -51,9 +54,6 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
         ORDER BY embedding <=> %s::vector
         LIMIT {K_NEIGHBORS}
     """, (query_str, query_str))
-
-    if index_type == "DiskANN":
-        cursor.execute("COMMIT;")
 
     results = cursor.fetchall()
     query_latency = time.time() - start_time
@@ -95,6 +95,7 @@ def main():
     query = np.load('query.npy')
     baseline_ids = np.load('baseline_ids.npy')
     vectors = np.load('vectors.npy')
+    num_vectors = len(vectors)
 
     # Compute baseline (brute force) query time
     print("\nComputing baseline (brute force) query time...")
@@ -119,7 +120,45 @@ def main():
     """)
     table_size = cursor.fetchone()[0]
 
-    # Test 1: DiskANN index
+    # Test 1: IVFFlat index (faster to build)
+    print("\n" + "="*60)
+    print("TESTING IVFFLAT INDEX")
+    print("="*60)
+
+    # Drop and create IVFFlat index
+    print("Dropping IVFFlat index if it exists...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_ivfflat")
+    conn.commit()
+
+    # Calculate optimal lists based on dataset size
+    # For up to 1M rows: rows / 1000, for over 1M: sqrt(rows)
+    if num_vectors <= 1_000_000:
+        lists = max(50, num_vectors // 1000)  # Minimum 50 lists
+    else:
+        lists = int(num_vectors ** 0.5)
+
+    # Calculate probes based on lists (sqrt(lists) as starting point, cap at lists)
+    probes = min(int(lists ** 0.5) * 6, lists)
+
+    print(f"Creating IVFFlat index with lists={lists} (probes will be {probes})...")
+    index_start = time.time()
+    cursor.execute(f"""
+        CREATE INDEX idx_vectors_embedding_ivfflat
+        ON vectors USING ivfflat (embedding vector_cosine_ops)
+        WITH (lists = {lists})
+    """)
+    conn.commit()
+    index_time = time.time() - index_start
+    print(f"IVFFlat index created in {index_time:.2f} seconds")
+
+    benchmark_index(cursor, 'idx_vectors_embedding_ivfflat', 'IVFFlat',
+                   query_str, baseline_ids, baseline_time, db_size, table_size, probes=probes)
+
+    print("Cleaning up IVFFlat index...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_ivfflat")
+    conn.commit()
+
+    # Test 2: DiskANN index (slower to build, run last)
     print("\n" + "="*60)
     print("TESTING DISKANN INDEX")
     print("="*60)
@@ -140,33 +179,6 @@ def main():
     print(f"DiskANN index created in {index_time:.2f} seconds")
 
     benchmark_index(cursor, 'idx_vectors_embedding_diskann', 'DiskANN',
-                   query_str, baseline_ids, baseline_time, db_size, table_size)
-
-    print("Cleaning up DiskANN index...")
-    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_diskann")
-    conn.commit()
-
-    # Test 2: HNSW index
-    print("\n" + "="*60)
-    print("TESTING HNSW INDEX")
-    print("="*60)
-
-    # Drop and create HNSW index
-    print("Dropping HNSW index if it exists...")
-    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_hnsw")
-    conn.commit()
-
-    print("Creating HNSW index...")
-    index_start = time.time()
-    cursor.execute("""
-        CREATE INDEX idx_vectors_embedding_hnsw
-        ON vectors USING hnsw (embedding vector_cosine_ops)
-    """)
-    conn.commit()
-    index_time = time.time() - index_start
-    print(f"HNSW index created in {index_time:.2f} seconds")
-
-    benchmark_index(cursor, 'idx_vectors_embedding_hnsw', 'HNSW',
                    query_str, baseline_ids, baseline_time, db_size, table_size)
 
     cursor.close()
