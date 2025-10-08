@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Query vectorchord and measure performance."""
+
+import numpy as np
+import psycopg2
+import time
+
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 5432,
+    'dbname': 'postgres',
+    'user': 'postgres',
+    'password': 'postgres'
+}
+
+K_NEIGHBORS = 100
+
+def compute_precision(retrieved_ids, baseline_ids):
+    """Compute retrieval precision (recall@K)."""
+    baseline_set = set(baseline_ids)
+    retrieved_set = set(retrieved_ids)
+    intersection = baseline_set & retrieved_set
+    precision = len(intersection) / len(baseline_ids)
+    return precision
+
+def main():
+    print("Loading query vector and baseline...")
+    query = np.load('query.npy')
+    baseline_ids = np.load('baseline_ids.npy')
+
+    print("Connecting to vectorchord database...")
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    # Warm-up query
+    print("Running warm-up query...")
+    query_str = '[' + ','.join(map(str, query)) + ']'
+    cursor.execute(f"""
+        SELECT id
+        FROM vectors
+        ORDER BY embedding <=> %s::vector
+        LIMIT {K_NEIGHBORS}
+    """, (query_str,))
+    cursor.fetchall()
+
+    # Actual benchmark query
+    print(f"\nQuerying for {K_NEIGHBORS} nearest neighbors...")
+    start_time = time.time()
+
+    cursor.execute(f"""
+        SELECT id, embedding <=> %s::vector as distance
+        FROM vectors
+        ORDER BY embedding <=> %s::vector
+        LIMIT {K_NEIGHBORS}
+    """, (query_str, query_str))
+
+    results = cursor.fetchall()
+    query_latency = time.time() - start_time
+
+    retrieved_ids = np.array([row[0] for row in results])
+    distances = np.array([row[1] for row in results])
+
+    # Compute precision
+    precision = compute_precision(retrieved_ids, baseline_ids)
+
+    # Get database stats
+    cursor.execute("SELECT pg_size_pretty(pg_database_size(current_database()))")
+    db_size = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT pg_size_pretty(pg_total_relation_size('vectors'))
+    """)
+    table_size = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT pg_size_pretty(pg_total_relation_size('idx_vectors_embedding_vchordrq'))
+    """)
+    index_size = cursor.fetchone()[0]
+
+    print("\n" + "="*60)
+    print("VECTORCHORD (vchordrq) BENCHMARK RESULTS")
+    print("="*60)
+    print(f"Query latency:        {query_latency*1000:.2f} ms")
+    print(f"Retrieval precision:  {precision*100:.2f}% ({int(precision*K_NEIGHBORS)}/{K_NEIGHBORS} matches)")
+    print(f"Database size:        {db_size}")
+    print(f"Table size:           {table_size}")
+    print(f"Index size:           {index_size}")
+    print("="*60)
+
+    print(f"\nTop 10 retrieved IDs: {retrieved_ids[:10].tolist()}")
+    print(f"Top 10 baseline IDs:  {baseline_ids[:10].tolist()}")
+
+    cursor.close()
+    conn.close()
+
+if __name__ == "__main__":
+    main()

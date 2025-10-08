@@ -1,0 +1,22 @@
+services:
+  postgres_db:
+    image: timescale/timescaledb-ha:pg17
+    command: [
+      "postgres",
+      "-c", "shared_buffers=4GB",
+      "-c", "effective_cache_size=8GB",
+      "-c", "work_mem=16MB",
+      "-c", "maintenance_work_mem=1GB"
+    ]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./pgvectorscale-init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgvectorscale-data:/var/lib/postgresql/data
+
+volumes:
+  pgvectorscale-data:
