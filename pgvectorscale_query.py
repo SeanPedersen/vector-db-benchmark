@@ -23,7 +23,7 @@ def compute_precision(retrieved_ids, baseline_ids):
     precision = len(intersection) / len(baseline_ids)
     return precision
 
-def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size, probes=None):
+def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size, probes=None, diskann_params=None):
     """Run benchmark for a specific index."""
     # Warm-up query
     print("Running warm-up query...")
@@ -40,9 +40,15 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
     start_time = time.time()
 
     if index_type == "DiskANN":
-        print("Setting optimized DiskANN query parameters...")
-        cursor.execute("SET diskann.query_rescore = 1000")
-        cursor.execute("SET diskann.l_value_is = 500")
+        if diskann_params:
+            query_search_list = diskann_params.get('search_list_size', 200)
+            query_rescore = max(1000, diskann_params.get('num_neighbors', 100) * 10)
+            print(f"Setting DiskANN query parameters: search_list={query_search_list}, rescore={query_rescore}")
+            cursor.execute(f"SET diskann.query_search_list_size = {query_search_list}")
+            cursor.execute(f"SET diskann.query_rescore = {query_rescore}")
+        else:
+            print("Setting default DiskANN query parameters...")
+            cursor.execute("SET diskann.query_rescore = 1000")
     elif index_type == "IVFFlat":
         probes_value = probes if probes is not None else 200
         print(f"Setting optimized IVFFlat query parameters (probes={probes_value})...")
@@ -168,18 +174,62 @@ def main():
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_diskann")
     conn.commit()
 
-    print("Creating DiskANN index...")
+    # Calculate optimal DiskANN parameters based on dataset size
+    if num_vectors < 1_000:
+        print("Warning: DiskANN requires at least 1,000 vectors for optimal performance")
+        num_neighbors = 32
+        search_list_size = 50
+        max_alpha = 1.0
+        storage_layout = 'memory_optimized'
+    elif num_vectors < 1_000_000:
+        # Small to Medium (1K-1M)
+        num_neighbors = 50
+        search_list_size = 100
+        max_alpha = 1.0
+        storage_layout = 'memory_optimized'
+    elif num_vectors < 100_000_000:
+        # Large (1M-100M)
+        num_neighbors = 100
+        search_list_size = 200
+        max_alpha = 1.2
+        storage_layout = 'disk_optimized'
+    else:
+        # Very Large (>100M)
+        num_neighbors = 200
+        search_list_size = 500
+        max_alpha = 1.5
+        storage_layout = 'disk_optimized'
+
+    print(f"Creating DiskANN index with optimized parameters:")
+    print(f"  num_neighbors={num_neighbors}, search_list_size={search_list_size}")
+    print(f"  max_alpha={max_alpha}, storage_layout='{storage_layout}'")
+
     index_start = time.time()
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE INDEX idx_vectors_embedding_diskann
         ON vectors USING diskann (embedding vector_cosine_ops)
+        WITH (
+            num_neighbors = {num_neighbors},
+            search_list_size = {search_list_size},
+            max_alpha = {max_alpha},
+            storage_layout = '{storage_layout}',
+            num_dimensions = 512
+        )
     """)
     conn.commit()
     index_time = time.time() - index_start
     print(f"DiskANN index created in {index_time:.2f} seconds")
 
+    diskann_params = {
+        'num_neighbors': num_neighbors,
+        'search_list_size': search_list_size,
+        'max_alpha': max_alpha,
+        'storage_layout': storage_layout
+    }
+
     benchmark_index(cursor, 'idx_vectors_embedding_diskann', 'DiskANN',
-                   query_str, baseline_ids, baseline_time, db_size, table_size)
+                   query_str, baseline_ids, baseline_time, db_size, table_size,
+                   diskann_params=diskann_params)
 
     cursor.close()
     conn.close()
