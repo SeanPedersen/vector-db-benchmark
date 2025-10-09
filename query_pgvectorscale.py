@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Query pgvectorscale and measure performance."""
+"""Query pgvectorscale indices and measure performance."""
 
 import numpy as np
 import psycopg2
@@ -108,7 +108,7 @@ def main():
     baseline_time = time.time() - baseline_start
     print(f"Baseline query time: {baseline_time*1000:.2f} ms")
 
-    print("\nConnecting to pgvectorscale database...")
+    print("\nConnecting to database...")
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 

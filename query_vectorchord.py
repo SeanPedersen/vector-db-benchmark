@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Query vectorchord and measure performance."""
+"""Query vectorchord indices and measure performance."""
 
 import numpy as np
 import psycopg2
@@ -95,7 +95,7 @@ def main():
     baseline_time = time.time() - baseline_start
     print(f"Baseline query time: {baseline_time*1000:.2f} ms")
 
-    print("\nConnecting to vectorchord database...")
+    print("\nConnecting to database...")
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
@@ -131,33 +131,6 @@ def main():
     print(f"Default index created in {index_time:.2f} seconds")
 
     benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_default', 'vchordrq',
-                   query_str, baseline_ids, baseline_time, db_size, table_size)
-
-    # Drop default index
-    print("\nCleaning up vchordrq index...")
-    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordrq_default")
-    conn.commit()
-
-    # Test 2: vchordg (DiskANN) index
-    print("\n" + "="*60)
-    print("TESTING VCHORDG (DISKANN) INDEX")
-    print("="*60)
-
-    print("Dropping vchordg index if it exists...")
-    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordg")
-    conn.commit()
-
-    print("\nCreating vchordg (DiskANN) index...")
-    index_start = time.time()
-    cursor.execute("""
-        CREATE INDEX idx_vectors_embedding_vchordg
-        ON vectors USING vchordg (embedding vector_cosine_ops)
-    """)
-    conn.commit()
-    index_time = time.time() - index_start
-    print(f"vchordg index created in {index_time:.2f} seconds")
-
-    benchmark_index(cursor, 'idx_vectors_embedding_vchordg', 'vchordg (DiskANN)',
                    query_str, baseline_ids, baseline_time, db_size, table_size)
 
     cursor.close()

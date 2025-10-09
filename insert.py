@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Insert vectors into vectorchord database."""
+"""Insert vectors into database (shared for all indices)."""
 
 import numpy as np
 import psycopg2
@@ -23,7 +23,7 @@ def main():
     ids = np.load('ids.npy')
 
     print(f"Loaded {len(vectors):,} vectors")
-    print("\nConnecting to vectorchord database...")
+    print("\nConnecting to database...")
 
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
@@ -31,7 +31,6 @@ def main():
     # Check if table already has the correct number of vectors
     cursor.execute("SELECT COUNT(*) FROM vectors")
     existing_count = cursor.fetchone()[0]
-    print(f"Existing vector count in database: {existing_count:,}")
 
     if existing_count == len(vectors):
         print(f"Table already contains {existing_count:,} vectors (matches dataset size). Skipping insertion.")
