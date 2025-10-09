@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Insert vectors into database (shared for all indices)."""
+"""Generate and insert vectors into database (shared for all indices)."""
 
 import numpy as np
 import psycopg2
 import time
+import argparse
 from psycopg2.extras import execute_values
 from tqdm import tqdm
 
@@ -16,15 +17,33 @@ DB_CONFIG = {
 }
 
 BATCH_SIZE = 10_000
+DIMENSIONS = 512
+
+def generate_vectors(num_vectors):
+    """Generate normalized random vectors."""
+    print(f"Generating {num_vectors:,} random vectors of dimension {DIMENSIONS}...")
+
+    # Set seed for reproducibility
+    np.random.seed(42)
+
+    # Generate random vectors (float32)
+    vectors = np.random.randn(num_vectors, DIMENSIONS).astype(np.float32)
+
+    # Normalize vectors for cosine similarity
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    vectors = vectors / norms
+
+    return vectors
 
 def main():
-    print("Loading vectors and IDs...")
-    vectors = np.load('vectors.npy')
-    ids = np.load('ids.npy')
+    parser = argparse.ArgumentParser(description="Generate and insert vectors into database")
+    parser.add_argument('--num-vectors', type=int, default=100000,
+                        help='Number of vectors to generate (default: 100000)')
+    args = parser.parse_args()
 
-    print(f"Loaded {len(vectors):,} vectors")
+    num_vectors = args.num_vectors
+
     print("\nConnecting to database...")
-
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
@@ -32,8 +51,8 @@ def main():
     cursor.execute("SELECT COUNT(*) FROM vectors")
     existing_count = cursor.fetchone()[0]
 
-    if existing_count == len(vectors):
-        print(f"Table already contains {existing_count:,} vectors (matches dataset size). Skipping insertion.")
+    if existing_count == num_vectors:
+        print(f"Table already contains {existing_count:,} vectors (matches requested size). Skipping insertion.")
         cursor.close()
         conn.close()
         return
@@ -44,12 +63,16 @@ def main():
         cursor.execute("TRUNCATE TABLE vectors")
         conn.commit()
 
-    print(f"\nInserting {len(vectors):,} vectors in batches of {BATCH_SIZE:,}...")
+    # Generate vectors
+    vectors = generate_vectors(num_vectors)
+    ids = np.arange(num_vectors, dtype=np.int64)
+
+    print(f"\nInserting {num_vectors:,} vectors in batches of {BATCH_SIZE:,}...")
     start_time = time.time()
 
     # Prepare data for batch insertion
-    for i in tqdm(range(0, len(vectors), BATCH_SIZE), desc="Inserting", unit="batch"):
-        batch_end = min(i + BATCH_SIZE, len(vectors))
+    for i in tqdm(range(0, num_vectors, BATCH_SIZE), desc="Inserting", unit="batch"):
+        batch_end = min(i + BATCH_SIZE, num_vectors)
         batch_data = [
             (int(ids[j]), vectors[j].tolist())
             for j in range(i, batch_end)

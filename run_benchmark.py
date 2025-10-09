@@ -7,6 +7,7 @@ import os
 import time
 import argparse
 import psycopg2
+from compute_baseline import compute_baseline
 
 def run_command(cmd, description):
     """Run a command and handle errors."""
@@ -80,30 +81,14 @@ def main():
     print("ANN BENCHMARK - pgvectorscale vs vectorchord")
     print("="*60)
 
-    # Step 1: Generate data
-    regenerate_data = False
-    if not os.path.exists('vectors.npy'):
-        regenerate_data = True
+    # Step 1: Generate query vector
+    if not os.path.exists('query.npy'):
+        print("\nStep 1: Generating query vector...")
+        run_command("python3 generate_data.py", "Query generation")
     else:
-        # Check if existing vectors.npy has the correct size
-        import numpy as np
-        existing_vectors = np.load('vectors.npy')
-        if len(existing_vectors) != args.num_vectors:
-            print(f"\nStep 1: Existing vectors.npy has {len(existing_vectors):,} vectors, but {args.num_vectors:,} requested.")
-            print("Regenerating data...")
-            regenerate_data = True
-        else:
-            print("\nStep 1: Using existing vectors.npy")
+        print("\nStep 1: Using existing query.npy")
 
-    if regenerate_data:
-        print(f"\nStep 1: Generating {args.num_vectors:,} random vectors...")
-        run_command(f"python3 generate_data.py --num-vectors {args.num_vectors}", "Data generation")
-
-    # Step 2: Compute baseline
-    print("\nStep 2: Computing exact baseline...")
-    run_command("python3 compute_baseline.py", "Baseline computation")
-
-    # Step 3: Start unified database
+    # Step 2: Start unified database
     print("\n" + "="*60)
     print("STARTING UNIFIED DATABASE")
     print("="*60)
@@ -116,16 +101,20 @@ def main():
         print("Error: Database failed to start")
         sys.exit(1)
 
-    # Step 4: Insert data (once for all benchmarks)
+    # Step 3: Insert data (once for all benchmarks)
     if not args.skip_insertion:
         # Check if table already has the correct number of vectors
         if check_table_count(args.num_vectors):
             print(f"\nTable already contains {args.num_vectors:,} vectors. Skipping insertion.")
         else:
-            print("\nInserting vectors into database...")
-            run_command("python3 insert.py", "Data insertion")
+            print(f"\nGenerating and inserting {args.num_vectors:,} vectors into database...")
+            run_command(f"python3 insert.py --num-vectors {args.num_vectors}", "Data insertion")
     else:
         print("\nSkipping insertion (--skip-insertion)")
+
+    # Step 4: Compute baseline (numpy + postgres brute force)
+    print("\nStep 4: Computing baselines (numpy brute force + postgres brute force)...")
+    numpy_baseline_time, postgres_baseline_time = compute_baseline()
 
     # Step 5: Test vectorchord
     if not args.skip_vectorchord:
@@ -134,7 +123,7 @@ def main():
         print("="*60)
 
         print("\nQuerying vectorchord indices...")
-        run_command("python3 query_vectorchord.py", "vectorchord query")
+        run_command(f"python3 query_vectorchord.py --baseline-time {postgres_baseline_time}", "vectorchord query")
     else:
         print("\n" + "="*60)
         print("SKIPPING VECTORCHORD (--skip-vectorchord)")
@@ -147,7 +136,7 @@ def main():
         print("="*60)
 
         print("\nQuerying pgvectorscale indices...")
-        run_command("python3 query_pgvectorscale.py", "pgvectorscale query")
+        run_command(f"python3 query_pgvectorscale.py --baseline-time {postgres_baseline_time}", "pgvectorscale query")
     else:
         print("\n" + "="*60)
         print("SKIPPING PGVECTORSCALE (--skip-pgvectorscale)")
