@@ -1,12 +1,10 @@
 #!/bin/bash
-# Reset databases by removing all Docker volumes
+# Reset database by removing Docker volume
 
-echo "Stopping all containers..."
-docker compose -f docker-compose-pgvectorscale.yml down 2>/dev/null
-docker compose -f docker-compose-vectorchord.yml down 2>/dev/null
+echo "Stopping container..."
+docker compose down
 
-echo "Removing Docker volumes..."
-docker volume rm ann-benchmark_pgvectorscale-data 2>/dev/null
-docker volume rm ann-benchmark_vectorchord-data 2>/dev/null
+echo "Removing Docker volume..."
+docker volume rm ann-benchmark_postgres-data 2>/dev/null
 
-echo "Database volumes removed. Databases will be recreated on next startup."
+echo "Database volume removed. Database will be recreated on next startup."
