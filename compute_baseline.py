@@ -21,24 +21,17 @@ def compute_baseline():
     Returns:
         tuple: (numpy_baseline_time, postgres_baseline_time) in seconds
     """
-    print("Loading query vector...")
     query = np.load('query.npy')
 
-    print("Connecting to database...")
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
     # Get vector count
     cursor.execute("SELECT COUNT(*) FROM vectors")
     count = cursor.fetchone()[0]
-    print(f"Database contains {count:,} vectors")
+    print(f"\n[Baseline] Computing brute force baseline on {count:,} vectors...")
 
     # Baseline 1: NumPy brute force (load all vectors from DB)
-    print(f"\n{'='*60}")
-    print("BASELINE 1: NumPy Brute Force")
-    print(f"{'='*60}")
-    print("Loading all vectors from database into memory...")
-
     load_start = time.time()
     cursor.execute("SELECT id, embedding::text FROM vectors ORDER BY id")
     rows = cursor.fetchall()
@@ -50,9 +43,6 @@ def compute_baseline():
         for row in rows
     ], dtype=np.float32)
     load_elapsed = time.time() - load_start
-    print(f"Loaded {len(rows):,} vectors in {load_elapsed:.3f} seconds")
-
-    print(f"\nComputing exact {K_NEIGHBORS} nearest neighbors using cosine similarity...")
 
     compute_start = time.time()
     # Compute cosine similarities (dot product for normalized vectors)
@@ -68,21 +58,19 @@ def compute_baseline():
     compute_elapsed = time.time() - compute_start
     total_numpy_elapsed = load_elapsed + compute_elapsed
 
-    print(f"Computation complete!")
-    print(f"  Load time: {load_elapsed:.3f} seconds ({load_elapsed*1000:.2f} ms)")
-    print(f"  Compute time: {compute_elapsed:.3f} seconds ({compute_elapsed*1000:.2f} ms)")
-    print(f"  Total time: {total_numpy_elapsed:.3f} seconds ({total_numpy_elapsed*1000:.2f} ms)")
-    print(f"\nTop {K_NEIGHBORS} nearest neighbors (IDs): {top_k_ids[:10]}... (showing first 10)")
-
-    # Save baseline results (for query scripts to compare)
-    print("\nSaving baseline results to baseline_ids.npy...")
-    np.save('baseline_ids.npy', top_k_ids)
+    print(f"[Baseline] NumPy brute force: {compute_elapsed*1000:.2f}ms (100% precision)")
 
     # Baseline 2: Postgres brute force (no index)
-    print(f"\n{'='*60}")
-    print("BASELINE 2: Postgres Brute Force (No Index)")
-    print(f"{'='*60}")
-    print(f"Running postgres query without index for top {K_NEIGHBORS} nearest neighbors...")
+    # Drop all existing indexes on embedding column to ensure true brute force
+    cursor.execute("""
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = 'vectors' AND indexname LIKE '%embedding%'
+    """)
+    existing_indexes = cursor.fetchall()
+    if existing_indexes:
+        for idx in existing_indexes:
+            cursor.execute(f"DROP INDEX IF EXISTS {idx[0]}")
+        conn.commit()
 
     # Make it hot
     query_list = query.tolist()
@@ -110,34 +98,32 @@ def compute_baseline():
     pg_elapsed = time.time() - pg_start
 
     pg_ids = np.array([row[0] for row in pg_results], dtype=np.int64)
-
-    print(f"Postgres query complete!")
-    print(f"  Query time: {pg_elapsed:.3f} seconds ({pg_elapsed*1000:.2f} ms)")
-    print(f"\nTop {K_NEIGHBORS} nearest neighbors (IDs): {pg_ids[:10]}... (showing first 10)")
+    pg_similarities = np.array([row[1] for row in pg_results], dtype=np.float64)
 
     # Compare results
-    print(f"\n{'='*60}")
-    print("COMPARISON")
-    print(f"{'='*60}")
-
-    # Check if results match
     matches = np.sum(np.isin(pg_ids, top_k_ids))
     recall = matches / K_NEIGHBORS
 
-    print(f"NumPy baseline time: {compute_elapsed:.3f} seconds ({compute_elapsed*1000:.2f} ms)")
-    print(f"Postgres baseline time: {pg_elapsed:.3f} seconds ({pg_elapsed*1000:.2f} ms)")
-    print(f"Results match: {matches}/{K_NEIGHBORS} ({recall*100:.1f}% recall)")
+    print(f"[Baseline] Postgres brute force: {pg_elapsed*1000:.2f}ms (100% precision)")
 
-    if recall < 1.0:
-        print("\nWARNING: Results don't match perfectly. This may be due to:")
-        print("  - Floating point precision differences")
-        print("  - Ties in similarity scores handled differently")
+    if recall == 1.0:
+        print(f"[Baseline] NumPy and Postgres results match perfectly ({matches}/{K_NEIGHBORS})")
+    elif recall >= 0.95:
+        print(f"[Baseline] NumPy and Postgres mostly match: {matches}/{K_NEIGHBORS} ({recall*100:.1f}% - likely due to floating point precision)")
+    else:
+        print(f"[Baseline] WARNING: Results differ significantly - {matches}/{K_NEIGHBORS} match ({recall*100:.1f}% recall)")
+        print(f"[Baseline] Top 10 NumPy IDs: {top_k_ids[:10].tolist()}")
+        print(f"[Baseline] Top 10 Postgres IDs: {pg_ids[:10].tolist()}")
 
     cursor.close()
     conn.close()
-    print("\nBaseline computation complete!")
 
-    return total_numpy_elapsed, pg_elapsed
+    return {
+        'numpy_time': total_numpy_elapsed,
+        'postgres_time': pg_elapsed,
+        'baseline_ids': top_k_ids,
+        'query': query
+    }
 
 def main():
     compute_baseline()

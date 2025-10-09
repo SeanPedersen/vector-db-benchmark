@@ -27,7 +27,6 @@ def compute_precision(retrieved_ids, baseline_ids):
 def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size):
     """Run benchmark for a specific index."""
     # Warm-up query
-    print("Running warm-up query...")
     cursor.execute(f"""
         SELECT id
         FROM vectors
@@ -37,7 +36,6 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
     cursor.fetchall()
 
     # Actual benchmark query
-    print(f"Querying for {K_NEIGHBORS} nearest neighbors...")
     start_time = time.time()
 
     cursor.execute(f"""
@@ -62,40 +60,23 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
     """)
     index_size = cursor.fetchone()[0]
 
-    print("\n" + "="*60)
-    print(f"VECTORCHORD ({index_type}) BENCHMARK RESULTS")
-    print("="*60)
-    print(f"Query latency:        {query_latency*1000:.2f} ms")
-    print(f"Retrieval precision:  {precision*100:.2f}% ({int(precision*K_NEIGHBORS)}/{K_NEIGHBORS} matches)")
-    print(f"Database size:        {db_size}")
-    print(f"Table size:           {table_size}")
-    print(f"Index size:           {index_size}")
-    print("="*60)
+    # Get index size in MB
+    cursor.execute(f"""
+        SELECT pg_total_relation_size('{index_name}') / (1024.0 * 1024.0)
+    """)
+    index_size_mb = cursor.fetchone()[0]
 
-    print(f"\nTop 10 retrieved IDs: {retrieved_ids[:10].tolist()}")
-    print(f"Top 10 baseline IDs:  {baseline_ids[:10].tolist()}")
+    print(f"✓ VectorChord ({index_type}): {query_latency*1000:.2f}ms, {precision*100:.0f}% precision")
 
-    if baseline_time is not None:
-        print("\n" + "="*60)
-        print("BASELINE (Brute Force) PERFORMANCE")
-        print("="*60)
-        print(f"Query latency:        {baseline_time*1000:.2f} ms")
-        print(f"Speedup:              {baseline_time/query_latency:.2f}x faster")
-        print("="*60)
+    return {
+        'query_latency': query_latency,
+        'precision': precision,
+        'index_size': index_size,
+        'index_size_mb': index_size_mb
+    }
 
-def main():
-    parser = argparse.ArgumentParser(description="Query vectorchord indices")
-    parser.add_argument('--baseline-time', type=float, default=None,
-                        help='Baseline query time in seconds (from compute_baseline.py)')
-    args = parser.parse_args()
-
-    print("Loading query vector and baseline...")
-    query = np.load('query.npy')
-    baseline_ids = np.load('baseline_ids.npy')
-
-    baseline_time = args.baseline_time
-
-    print("\nConnecting to database...")
+def run_benchmark(query, baseline_ids, baseline_time):
+    """Run vectorchord benchmark and return results."""
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
@@ -111,16 +92,10 @@ def main():
     table_size = cursor.fetchone()[0]
 
     # Test 1: Default index
-    print("\n" + "="*60)
-    print("TESTING DEFAULT INDEX")
-    print("="*60)
-
-    # Drop and recreate default index
-    print("Dropping default index if it exists...")
+    print("\n[VectorChord] Building vchordrq index...")
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordrq_default")
     conn.commit()
 
-    print("Creating default index...")
     index_start = time.time()
     cursor.execute("""
         CREATE INDEX idx_vectors_embedding_vchordrq_default
@@ -128,13 +103,36 @@ def main():
     """)
     conn.commit()
     index_time = time.time() - index_start
-    print(f"Default index created in {index_time:.2f} seconds")
+    print(f"[VectorChord] Index built in {index_time:.2f}s")
 
-    benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_default', 'vchordrq',
+    result = benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_default', 'vchordrq',
                    query_str, baseline_ids, baseline_time, db_size, table_size)
 
     cursor.close()
     conn.close()
+
+    return {
+        'method': 'vchordrq',
+        'latency': result['query_latency'],
+        'precision': result['precision'],
+        'build_time': index_time,
+        'size_mb': result['index_size_mb']
+    }
+
+def main():
+    parser = argparse.ArgumentParser(description="Query vectorchord indices")
+    parser.add_argument('--baseline-time', type=float, default=None,
+                        help='Baseline query time in seconds (from compute_baseline.py)')
+    args = parser.parse_args()
+
+    query = np.load('query.npy')
+    baseline_ids = np.load('baseline_ids.npy')
+
+    result = run_benchmark(query, baseline_ids, args.baseline_time)
+
+    # Output results for main script to capture (stderr so it doesn't appear in stdout)
+    import sys
+    print(f"RESULT:{result['method']}:{result['latency']}:{result['precision']}:{result['build_time']}:{result['size_mb']}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

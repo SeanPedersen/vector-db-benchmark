@@ -43,7 +43,6 @@ def main():
 
     num_vectors = args.num_vectors
 
-    print("\nConnecting to database...")
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
@@ -52,14 +51,14 @@ def main():
     existing_count = cursor.fetchone()[0]
 
     if existing_count == num_vectors:
-        print(f"Table already contains {existing_count:,} vectors (matches requested size). Skipping insertion.")
+        print(f"\n[Insert] Table already contains {existing_count:,} vectors. Skipping insertion.")
         cursor.close()
         conn.close()
         return
 
     # Clear existing data if count doesn't match
     if existing_count > 0:
-        print(f"Clearing existing data ({existing_count:,} vectors)...")
+        print(f"\n[Insert] Clearing existing {existing_count:,} vectors...")
         cursor.execute("TRUNCATE TABLE vectors")
         conn.commit()
 
@@ -67,7 +66,7 @@ def main():
     vectors = generate_vectors(num_vectors)
     ids = np.arange(num_vectors, dtype=np.int64)
 
-    print(f"\nInserting {num_vectors:,} vectors in batches of {BATCH_SIZE:,}...")
+    print(f"[Insert] Inserting {num_vectors:,} vectors...")
     start_time = time.time()
 
     # Prepare data for batch insertion
@@ -95,14 +94,10 @@ def main():
     cursor.execute("SELECT COUNT(*) FROM vectors")
     count = cursor.fetchone()[0]
 
-    print(f"\nInsertion complete!")
-    print(f"  Total vectors: {count:,}")
-    print(f"  Total time: {elapsed:.2f} seconds")
-    print(f"  Throughput: {count / elapsed:.0f} vectors/second")
+    print(f"[Insert] Complete! {count:,} vectors in {elapsed:.2f}s ({count / elapsed:.0f} vectors/s)")
 
     cursor.close()
     conn.close()
-    print("Connection closed.")
 
 if __name__ == "__main__":
     main()

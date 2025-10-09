@@ -27,7 +27,6 @@ def compute_precision(retrieved_ids, baseline_ids):
 def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size, probes=None, diskann_params=None, hnsw_ef=None):
     """Run benchmark for a specific index."""
     # Warm-up query
-    print("Running warm-up query...")
     cursor.execute(f"""
         SELECT id
         FROM vectors
@@ -37,19 +36,15 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
     cursor.fetchall()
 
     # Actual benchmark query
-    print(f"Querying for {K_NEIGHBORS} nearest neighbors...")
     start_time = time.time()
 
     if index_type == "DiskANN":
-        # Use default query parameters (no custom settings needed)
         pass
     elif index_type == "IVFFlat":
         probes_value = probes if probes is not None else 200
-        print(f"Setting optimized IVFFlat query parameters (probes={probes_value})...")
         cursor.execute(f"SET ivfflat.probes = {probes_value}")
     elif index_type == "HNSW":
         ef_value = hnsw_ef if hnsw_ef is not None else 100
-        print(f"Setting optimized HNSW query parameters (ef_search={ef_value})...")
         cursor.execute(f"SET hnsw.ef_search = {ef_value}")
 
     cursor.execute(f"""
@@ -74,47 +69,29 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
     """)
     index_size = cursor.fetchone()[0]
 
-    print("\n" + "="*60)
-    print(f"PGVECTORSCALE ({index_type}) BENCHMARK RESULTS")
-    print("="*60)
-    print(f"Query latency:        {query_latency*1000:.2f} ms")
-    print(f"Retrieval precision:  {precision*100:.2f}% ({int(precision*K_NEIGHBORS)}/{K_NEIGHBORS} matches)")
-    print(f"Database size:        {db_size}")
-    print(f"Table size:           {table_size}")
-    print(f"Index size:           {index_size}")
-    print("="*60)
+    # Get index size in MB
+    cursor.execute(f"""
+        SELECT pg_total_relation_size('{index_name}') / (1024.0 * 1024.0)
+    """)
+    index_size_mb = cursor.fetchone()[0]
 
-    print(f"\nTop 10 retrieved IDs: {retrieved_ids[:10].tolist()}")
-    print(f"Top 10 baseline IDs:  {baseline_ids[:10].tolist()}")
+    print(f"✓ pgvectorscale ({index_type}): {query_latency*1000:.2f}ms, {precision*100:.0f}% precision")
 
-    if baseline_time is not None:
-        print("\n" + "="*60)
-        print("BASELINE (Brute Force) PERFORMANCE")
-        print("="*60)
-        print(f"Query latency:        {baseline_time*1000:.2f} ms")
-        print(f"Speedup:              {baseline_time/query_latency:.2f}x faster")
-        print("="*60)
+    return {
+        'query_latency': query_latency,
+        'precision': precision,
+        'index_size': index_size,
+        'index_size_mb': index_size_mb
+    }
 
-def main():
-    parser = argparse.ArgumentParser(description="Query pgvectorscale indices")
-    parser.add_argument('--baseline-time', type=float, default=None,
-                        help='Baseline query time in seconds (from compute_baseline.py)')
-    args = parser.parse_args()
-
-    print("Loading query vector and baseline...")
-    query = np.load('query.npy')
-    baseline_ids = np.load('baseline_ids.npy')
-
-    baseline_time = args.baseline_time
-
-    print("\nConnecting to database...")
+def run_benchmark(query, baseline_ids, baseline_time):
+    """Run pgvectorscale benchmarks and return results."""
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
     # Get number of vectors from database
     cursor.execute("SELECT COUNT(*) FROM vectors")
     num_vectors = cursor.fetchone()[0]
-    print(f"Database contains {num_vectors:,} vectors")
 
     query_str = '[' + ','.join(map(str, query)) + ']'
 
@@ -127,12 +104,10 @@ def main():
     """)
     table_size = cursor.fetchone()[0]
 
-    # Test 0: HNSW index (added before IVFFlat)
-    print("\n" + "="*60)
-    print("TESTING HNSW INDEX")
-    print("="*60)
+    results = []
 
-    print("Dropping HNSW index if it exists...")
+    # Test 0: HNSW index
+    print("\n[pgvectorscale] Building HNSW index...")
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_hnsw")
     conn.commit()
 
@@ -150,7 +125,6 @@ def main():
         ef_construction = 400
         ef_search = 300
 
-    print(f"Creating HNSW index with parameters: m={m}, ef_construction={ef_construction}")
     index_start = time.time()
     cursor.execute(f"""
         CREATE INDEX idx_vectors_embedding_hnsw
@@ -158,38 +132,31 @@ def main():
         WITH (m = {m}, ef_construction = {ef_construction})
     """)
     conn.commit()
-    index_time = time.time() - index_start
-    print(f"HNSW index created in {index_time:.2f} seconds")
+    hnsw_index_time = time.time() - index_start
+    print(f"[pgvectorscale] HNSW index built in {hnsw_index_time:.2f}s")
 
-    benchmark_index(cursor, 'idx_vectors_embedding_hnsw', 'HNSW',
+    hnsw_result = benchmark_index(cursor, 'idx_vectors_embedding_hnsw', 'HNSW',
                     query_str, baseline_ids, baseline_time, db_size, table_size,
                     hnsw_ef=ef_search)
 
-    print("Cleaning up HNSW index...")
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_hnsw")
     conn.commit()
 
-    # Test 1: IVFFlat index (faster to build)
-    print("\n" + "="*60)
-    print("TESTING IVFFLAT INDEX")
-    print("="*60)
+    results.append(('HNSW', hnsw_result, hnsw_index_time))
 
-    # Drop and create IVFFlat index
-    print("Dropping IVFFlat index if it exists...")
+    # Test 1: IVFFlat index
+    print("\n[pgvectorscale] Building IVFFlat index...")
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_ivfflat")
     conn.commit()
 
     # Calculate optimal lists based on dataset size
-    # For up to 1M rows: rows / 1000, for over 1M: sqrt(rows)
     if num_vectors <= 1_000_000:
-        lists = max(50, num_vectors // 1000)  # Minimum 50 lists
+        lists = max(50, num_vectors // 1000)
     else:
         lists = int(num_vectors ** 0.5)
 
-    # Calculate probes: recommended value is sqrt(lists)
     probes = int(lists ** 0.5)
 
-    print(f"Creating IVFFlat index with lists={lists} (probes will be {probes})...")
     index_start = time.time()
     cursor.execute(f"""
         CREATE INDEX idx_vectors_embedding_ivfflat
@@ -197,55 +164,41 @@ def main():
         WITH (lists = {lists})
     """)
     conn.commit()
-    index_time = time.time() - index_start
-    print(f"IVFFlat index created in {index_time:.2f} seconds")
+    ivf_index_time = time.time() - index_start
+    print(f"[pgvectorscale] IVFFlat index built in {ivf_index_time:.2f}s")
 
-    benchmark_index(cursor, 'idx_vectors_embedding_ivfflat', 'IVFFlat',
+    ivf_result = benchmark_index(cursor, 'idx_vectors_embedding_ivfflat', 'IVFFlat',
                    query_str, baseline_ids, baseline_time, db_size, table_size, probes=probes)
 
-    print("Cleaning up IVFFlat index...")
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_ivfflat")
     conn.commit()
 
-    # Test 2: DiskANN index (slower to build, run last)
-    print("\n" + "="*60)
-    print("TESTING DISKANN INDEX")
-    print("="*60)
+    results.append(('IVFFlat', ivf_result, ivf_index_time))
 
-    # Drop and recreate DiskANN index
-    print("Dropping DiskANN index if it exists...")
+    # Test 2: DiskANN index
+    print("\n[pgvectorscale] Building DiskANN index...")
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_diskann")
     conn.commit()
 
     # Calculate optimal DiskANN parameters based on dataset size
-    # Note: memory_optimized uses SBQ compression for better storage efficiency and I/O performance
     if num_vectors < 1_042:
-        print("Warning: DiskANN requires at least 1,000 vectors for optimal performance")
         num_neighbors = 32
         search_list_size = 50
         max_alpha = 1.0
     elif num_vectors < 1_000_042:
-        # Small to Medium (1K-1M)
         num_neighbors = 50
         search_list_size = 100
         max_alpha = 1.0
     elif num_vectors < 100_000_000:
-        # Large (1M-100M)
         num_neighbors = 100
         search_list_size = 200
         max_alpha = 1.2
     else:
-        # Very Large (>100M)
         num_neighbors = 200
         search_list_size = 500
         max_alpha = 1.5
 
-    # Use memory_optimized (SBQ compression) for all dataset sizes - best balance of storage & performance
     storage_layout = 'memory_optimized'
-
-    print(f"Creating DiskANN index with optimized parameters:")
-    print(f"  num_neighbors={num_neighbors}, search_list_size={search_list_size}")
-    print(f"  max_alpha={max_alpha}, storage_layout='{storage_layout}'")
 
     index_start = time.time()
     cursor.execute(f"""
@@ -260,8 +213,8 @@ def main():
         )
     """)
     conn.commit()
-    index_time = time.time() - index_start
-    print(f"DiskANN index created in {index_time:.2f} seconds")
+    diskann_index_time = time.time() - index_start
+    print(f"[pgvectorscale] DiskANN index built in {diskann_index_time:.2f}s")
 
     diskann_params = {
         'num_neighbors': num_neighbors,
@@ -270,12 +223,42 @@ def main():
         'storage_layout': storage_layout
     }
 
-    benchmark_index(cursor, 'idx_vectors_embedding_diskann', 'DiskANN',
+    diskann_result = benchmark_index(cursor, 'idx_vectors_embedding_diskann', 'DiskANN',
                    query_str, baseline_ids, baseline_time, db_size, table_size,
                    diskann_params=diskann_params)
 
+    results.append(('DiskANN', diskann_result, diskann_index_time))
+
     cursor.close()
     conn.close()
+
+    # Return formatted results
+    return [
+        {
+            'method': index_type,
+            'latency': result['query_latency'],
+            'precision': result['precision'],
+            'build_time': index_time,
+            'size_mb': result['index_size_mb']
+        }
+        for index_type, result, index_time in results
+    ]
+
+def main():
+    parser = argparse.ArgumentParser(description="Query pgvectorscale indices")
+    parser.add_argument('--baseline-time', type=float, default=None,
+                        help='Baseline query time in seconds (from compute_baseline.py)')
+    args = parser.parse_args()
+
+    query = np.load('query.npy')
+    baseline_ids = np.load('baseline_ids.npy')
+
+    results = run_benchmark(query, baseline_ids, args.baseline_time)
+
+    # Output results for main script to capture (stderr so it doesn't appear in stdout)
+    import sys
+    for result in results:
+        print(f"RESULT:{result['method']}:{result['latency']}:{result['precision']}:{result['build_time']}:{result['size_mb']}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
