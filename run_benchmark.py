@@ -132,8 +132,11 @@ def main():
         if check_table_count(args.num_vectors):
             print(f"[Setup] Table already contains {args.num_vectors:,} vectors")
         else:
-            result = run_command(f"python3 insert.py --num-vectors {args.num_vectors}", "Data insertion")
-            print(result.stdout)
+            # Run insertion with live output (no capture) so user can see progress
+            result = subprocess.run(f"python3 insert.py --num-vectors {args.num_vectors}", shell=True)
+            if result.returncode != 0:
+                print(f"Error: Data insertion failed with exit code {result.returncode}")
+                sys.exit(1)
     else:
         print("[Setup] Skipping insertion (--skip-insertion)")
 

@@ -4,6 +4,7 @@
 import numpy as np
 import psycopg2
 import time
+from tqdm import tqdm
 
 K_NEIGHBORS = 100
 
@@ -33,30 +34,88 @@ def compute_baseline():
 
     # Baseline 1: NumPy brute force (load all vectors from DB)
     load_start = time.time()
-    cursor.execute("SELECT id, embedding::text FROM vectors ORDER BY id")
-    rows = cursor.fetchall()
-    # Convert to numpy arrays
-    ids = np.array([row[0] for row in rows], dtype=np.int64)
-    # Parse vector strings like '[1.0,2.0,3.0]' to numpy arrays
-    vectors = np.array([
-        [float(x) for x in row[1].strip('[]').split(',')]
-        for row in rows
-    ], dtype=np.float32)
-    load_elapsed = time.time() - load_start
 
-    compute_start = time.time()
-    # Compute cosine similarities (dot product for normalized vectors)
-    similarities = np.dot(vectors, query)
+    if count > 100000:
+        # Process in batches to save memory
+        num_batches = 10
+        batch_size = (count + num_batches - 1) // num_batches  # Ceiling division
+        print(f"[Baseline] Processing {count:,} vectors in {num_batches} batches of ~{batch_size:,} vectors each")
 
-    # Get top K indices (argsort in descending order)
-    top_k_indices = np.argsort(similarities)[::-1][:K_NEIGHBORS]
+        all_top_k_ids = []
+        all_top_k_similarities = []
 
-    # Get the corresponding IDs
-    top_k_ids = ids[top_k_indices]
-    top_k_similarities = similarities[top_k_indices]
+        compute_elapsed = 0
 
-    compute_elapsed = time.time() - compute_start
-    total_numpy_elapsed = load_elapsed + compute_elapsed
+        for batch_idx in tqdm(range(num_batches), desc="[Baseline] Processing batches", unit="batch"):
+            offset = batch_idx * batch_size
+            cursor.execute(
+                "SELECT id, embedding::text FROM vectors ORDER BY id LIMIT %s OFFSET %s",
+                (batch_size, offset)
+            )
+            rows = cursor.fetchall()
+
+            if not rows:
+                break
+
+            # Convert to numpy arrays
+            batch_ids = np.array([row[0] for row in rows], dtype=np.int64)
+            batch_vectors = np.array([
+                [float(x) for x in row[1].strip('[]').split(',')]
+                for row in rows
+            ], dtype=np.float32)
+
+            # Compute cosine similarities for this batch
+            compute_start = time.time()
+            batch_similarities = np.dot(batch_vectors, query)
+
+            # Get top K from this batch
+            batch_top_k_indices = np.argsort(batch_similarities)[::-1][:K_NEIGHBORS]
+            batch_top_k_ids = batch_ids[batch_top_k_indices]
+            batch_top_k_similarities = batch_similarities[batch_top_k_indices]
+            compute_elapsed += time.time() - compute_start
+
+            all_top_k_ids.append(batch_top_k_ids)
+            all_top_k_similarities.append(batch_top_k_similarities)
+
+        # Combine all batch results and find global top K
+        compute_start = time.time()
+        all_top_k_ids = np.concatenate(all_top_k_ids)
+        all_top_k_similarities = np.concatenate(all_top_k_similarities)
+
+        # Get final top K
+        final_top_k_indices = np.argsort(all_top_k_similarities)[::-1][:K_NEIGHBORS]
+        top_k_ids = all_top_k_ids[final_top_k_indices]
+        top_k_similarities = all_top_k_similarities[final_top_k_indices]
+        compute_elapsed += time.time() - compute_start
+
+        load_elapsed = time.time() - load_start
+        total_numpy_elapsed = load_elapsed
+    else:
+        # Original single-pass implementation for smaller datasets
+        cursor.execute("SELECT id, embedding::text FROM vectors ORDER BY id")
+        rows = cursor.fetchall()
+        # Convert to numpy arrays
+        ids = np.array([row[0] for row in rows], dtype=np.int64)
+        # Parse vector strings like '[1.0,2.0,3.0]' to numpy arrays
+        vectors = np.array([
+            [float(x) for x in row[1].strip('[]').split(',')]
+            for row in rows
+        ], dtype=np.float32)
+        load_elapsed = time.time() - load_start
+
+        compute_start = time.time()
+        # Compute cosine similarities (dot product for normalized vectors)
+        similarities = np.dot(vectors, query)
+
+        # Get top K indices (argsort in descending order)
+        top_k_indices = np.argsort(similarities)[::-1][:K_NEIGHBORS]
+
+        # Get the corresponding IDs
+        top_k_ids = ids[top_k_indices]
+        top_k_similarities = similarities[top_k_indices]
+
+        compute_elapsed = time.time() - compute_start
+        total_numpy_elapsed = load_elapsed + compute_elapsed
 
     print(f"[Baseline] NumPy brute force: {compute_elapsed*1000:.2f}ms (100% precision)")
 
