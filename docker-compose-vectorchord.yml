@@ -3,6 +3,7 @@ services:
     image: tensorchord/vchord-postgres:pg18-v0.5.3
     command: [
       "postgres",
+      "-c", "shared_preload_libraries=vchord",
       "-c", "shared_buffers=4GB",
       "-c", "effective_cache_size=12GB",
       "-c", "work_mem=32MB",
