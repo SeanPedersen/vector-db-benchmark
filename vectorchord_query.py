@@ -23,7 +23,7 @@ def compute_precision(retrieved_ids, baseline_ids):
     precision = len(intersection) / len(baseline_ids)
     return precision
 
-def benchmark_index(cursor, index_name, query_str, baseline_ids, baseline_time, db_size, table_size):
+def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size):
     """Run benchmark for a specific index."""
     # Warm-up query
     print("Running warm-up query...")
@@ -62,7 +62,7 @@ def benchmark_index(cursor, index_name, query_str, baseline_ids, baseline_time, 
     index_size = cursor.fetchone()[0]
 
     print("\n" + "="*60)
-    print(f"VECTORCHORD ({index_name}) BENCHMARK RESULTS")
+    print(f"VECTORCHORD ({index_type}) BENCHMARK RESULTS")
     print("="*60)
     print(f"Query latency:        {query_latency*1000:.2f} ms")
     print(f"Retrieval precision:  {precision*100:.2f}% ({int(precision*K_NEIGHBORS)}/{K_NEIGHBORS} matches)")
@@ -130,39 +130,34 @@ def main():
     index_time = time.time() - index_start
     print(f"Default index created in {index_time:.2f} seconds")
 
-    benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_default',
+    benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_default', 'vchordrq',
                    query_str, baseline_ids, baseline_time, db_size, table_size)
 
-    # Drop default index and create optimized one
-    print("\n" + "="*60)
-    print("SWITCHING TO OPTIMIZED INDEX")
-    print("="*60)
-
-    print("Dropping optimized index if it exists...")
-    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordrq_optimized")
+    # Drop default index
+    print("\nCleaning up vchordrq index...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordrq_default")
     conn.commit()
 
-    print("\nCreating optimized vchordrq index with residual quantization...")
+    # Test 2: vchordg (DiskANN) index
+    print("\n" + "="*60)
+    print("TESTING VCHORDG (DISKANN) INDEX")
+    print("="*60)
+
+    print("Dropping vchordg index if it exists...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_vchordg")
+    conn.commit()
+
+    print("\nCreating vchordg (DiskANN) index...")
     index_start = time.time()
     cursor.execute("""
-        CREATE INDEX idx_vectors_embedding_vchordrq_optimized
-        ON vectors USING vchordrq (embedding vector_cosine_ops) WITH (options = $$
-residual_quantization = true
-build.pin = true
-[build.internal]
-spherical_centroids = true
-build_threads = 8
-$$)
+        CREATE INDEX idx_vectors_embedding_vchordg
+        ON vectors USING vchordg (embedding vector_cosine_ops)
     """)
     conn.commit()
     index_time = time.time() - index_start
-    print(f"Optimized index created in {index_time:.2f} seconds")
+    print(f"vchordg index created in {index_time:.2f} seconds")
 
-    # Test 2: Optimized index
-    print("\n" + "="*60)
-    print("TESTING OPTIMIZED INDEX")
-    print("="*60)
-    benchmark_index(cursor, 'idx_vectors_embedding_vchordrq_optimized',
+    benchmark_index(cursor, 'idx_vectors_embedding_vchordg', 'vchordg (DiskANN)',
                    query_str, baseline_ids, baseline_time, db_size, table_size)
 
     cursor.close()
