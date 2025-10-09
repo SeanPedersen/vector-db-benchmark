@@ -23,7 +23,7 @@ def compute_precision(retrieved_ids, baseline_ids):
     precision = len(intersection) / len(baseline_ids)
     return precision
 
-def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size, probes=None, diskann_params=None):
+def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, baseline_time, db_size, table_size, probes=None, diskann_params=None, hnsw_ef=None):
     """Run benchmark for a specific index."""
     # Warm-up query
     print("Running warm-up query...")
@@ -46,6 +46,10 @@ def benchmark_index(cursor, index_name, index_type, query_str, baseline_ids, bas
         probes_value = probes if probes is not None else 200
         print(f"Setting optimized IVFFlat query parameters (probes={probes_value})...")
         cursor.execute(f"SET ivfflat.probes = {probes_value}")
+    elif index_type == "HNSW":
+        ef_value = hnsw_ef if hnsw_ef is not None else 100
+        print(f"Setting optimized HNSW query parameters (ef_search={ef_value})...")
+        cursor.execute(f"SET hnsw.ef_search = {ef_value}")
 
     cursor.execute(f"""
         SELECT id, embedding <=> %s::vector as distance
@@ -119,6 +123,48 @@ def main():
     """)
     table_size = cursor.fetchone()[0]
 
+    # Test 0: HNSW index (added before IVFFlat)
+    print("\n" + "="*60)
+    print("TESTING HNSW INDEX")
+    print("="*60)
+
+    print("Dropping HNSW index if it exists...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_hnsw")
+    conn.commit()
+
+    # Choose HNSW params based on dataset size
+    if num_vectors < 1_000_042:
+        m = 16
+        ef_construction = 200
+        ef_search = 100
+    elif num_vectors < 10_000_000:
+        m = 24
+        ef_construction = 300
+        ef_search = 200
+    else:
+        m = 32
+        ef_construction = 400
+        ef_search = 300
+
+    print(f"Creating HNSW index with parameters: m={m}, ef_construction={ef_construction}")
+    index_start = time.time()
+    cursor.execute(f"""
+        CREATE INDEX idx_vectors_embedding_hnsw
+        ON vectors USING hnsw (embedding vector_cosine_ops)
+        WITH (m = {m}, ef_construction = {ef_construction})
+    """)
+    conn.commit()
+    index_time = time.time() - index_start
+    print(f"HNSW index created in {index_time:.2f} seconds")
+
+    benchmark_index(cursor, 'idx_vectors_embedding_hnsw', 'HNSW',
+                    query_str, baseline_ids, baseline_time, db_size, table_size,
+                    hnsw_ef=ef_search)
+
+    print("Cleaning up HNSW index...")
+    cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_hnsw")
+    conn.commit()
+
     # Test 1: IVFFlat index (faster to build)
     print("\n" + "="*60)
     print("TESTING IVFFLAT INDEX")
@@ -169,12 +215,12 @@ def main():
 
     # Calculate optimal DiskANN parameters based on dataset size
     # Note: memory_optimized uses SBQ compression for better storage efficiency and I/O performance
-    if num_vectors < 1_000:
+    if num_vectors < 1_042:
         print("Warning: DiskANN requires at least 1,000 vectors for optimal performance")
         num_neighbors = 32
         search_list_size = 50
         max_alpha = 1.0
-    elif num_vectors < 1_000_000:
+    elif num_vectors < 1_000_042:
         # Small to Medium (1K-1M)
         num_neighbors = 50
         search_list_size = 100
