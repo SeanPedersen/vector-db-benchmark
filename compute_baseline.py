@@ -42,13 +42,6 @@ def compute_baseline():
     load_start = time.time()
     cursor.execute("SELECT id, embedding::text FROM vectors ORDER BY id")
     rows = cursor.fetchall()
-    load_elapsed = time.time() - load_start
-    print(f"Loaded {len(rows):,} vectors in {load_elapsed:.3f} seconds")
-
-    print(f"\nComputing exact {K_NEIGHBORS} nearest neighbors using cosine similarity...")
-
-    compute_start = time.time()
-
     # Convert to numpy arrays
     ids = np.array([row[0] for row in rows], dtype=np.int64)
     # Parse vector strings like '[1.0,2.0,3.0]' to numpy arrays
@@ -56,7 +49,12 @@ def compute_baseline():
         [float(x) for x in row[1].strip('[]').split(',')]
         for row in rows
     ], dtype=np.float32)
+    load_elapsed = time.time() - load_start
+    print(f"Loaded {len(rows):,} vectors in {load_elapsed:.3f} seconds")
 
+    print(f"\nComputing exact {K_NEIGHBORS} nearest neighbors using cosine similarity...")
+
+    compute_start = time.time()
     # Compute cosine similarities (dot product for normalized vectors)
     similarities = np.dot(vectors, query)
 
@@ -85,6 +83,17 @@ def compute_baseline():
     print("BASELINE 2: Postgres Brute Force (No Index)")
     print(f"{'='*60}")
     print(f"Running postgres query without index for top {K_NEIGHBORS} nearest neighbors...")
+
+    # Make it hot
+    query_list = query.tolist()
+    cursor.execute("""
+        SELECT id, 1 - (embedding <=> %s::vector) AS similarity
+        FROM vectors
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
+    """, (query_list, query_list, K_NEIGHBORS))
+
+    pg_results = cursor.fetchall()
 
     pg_start = time.time()
 
@@ -115,7 +124,7 @@ def compute_baseline():
     matches = np.sum(np.isin(pg_ids, top_k_ids))
     recall = matches / K_NEIGHBORS
 
-    print(f"NumPy baseline time: {total_numpy_elapsed:.3f} seconds ({total_numpy_elapsed*1000:.2f} ms)")
+    print(f"NumPy baseline time: {compute_elapsed:.3f} seconds ({compute_elapsed*1000:.2f} ms)")
     print(f"Postgres baseline time: {pg_elapsed:.3f} seconds ({pg_elapsed*1000:.2f} ms)")
     print(f"Results match: {matches}/{K_NEIGHBORS} ({recall*100:.1f}% recall)")
 
