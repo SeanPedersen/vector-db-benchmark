@@ -9,14 +9,15 @@ from psycopg2.extras import execute_values
 from tqdm import tqdm
 
 DB_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'dbname': 'postgres',
-    'user': 'postgres',
-    'password': 'postgres'
+    "host": "localhost",
+    "port": 5432,
+    "dbname": "postgres",
+    "user": "postgres",
+    "password": "postgres",
 }
 
 BATCH_SIZE = 10_000
+
 
 def generate_vectors(num_vectors, dimensions):
     """Generate normalized random vectors."""
@@ -34,14 +35,26 @@ def generate_vectors(num_vectors, dimensions):
 
     return vectors
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate and insert vectors into database")
-    parser.add_argument('--num-vectors', type=int, default=100000,
-                        help='Number of vectors to generate (default: 100000)')
-    parser.add_argument('--dimensions', type=int, default=512,
-                        help='Vector dimensions (default: 512)')
-    parser.add_argument('--vectors-file', type=str, default=None,
-                        help='Path to .npy file containing pre-generated vectors (optional)')
+    parser = argparse.ArgumentParser(
+        description="Generate and insert vectors into database"
+    )
+    parser.add_argument(
+        "--num-vectors",
+        type=int,
+        default=100000,
+        help="Number of vectors to generate (default: 100000)",
+    )
+    parser.add_argument(
+        "--dimensions", type=int, default=512, help="Vector dimensions (default: 512)"
+    )
+    parser.add_argument(
+        "--vectors-file",
+        type=str,
+        default=None,
+        help="Path to .npy file containing pre-generated vectors (optional)",
+    )
     args = parser.parse_args()
 
     num_vectors = args.num_vectors
@@ -57,7 +70,9 @@ def main():
 
         # Validate shape
         if vectors.ndim != 2:
-            print(f"Error: Expected 2D array of shape (N, D), got {vectors.ndim}D array with shape {vectors.shape}")
+            print(
+                f"Error: Expected 2D array of shape (N, D), got {vectors.ndim}D array with shape {vectors.shape}"
+            )
             cursor.close()
             conn.close()
             return
@@ -72,7 +87,9 @@ def main():
     # Create or recreate table with correct dimensions
     print(f"[Insert] Creating table for {dimensions}-dimensional vectors...")
     cursor.execute("DROP TABLE IF EXISTS vectors")
-    cursor.execute(f"CREATE TABLE vectors (id BIGINT PRIMARY KEY, embedding vector({dimensions}))")
+    cursor.execute(
+        f"CREATE TABLE vectors (id BIGINT PRIMARY KEY, embedding vector({dimensions}))"
+    )
     conn.commit()
 
     ids = np.arange(num_vectors, dtype=np.int64)
@@ -83,16 +100,13 @@ def main():
     # Prepare data for batch insertion
     for i in tqdm(range(0, num_vectors, BATCH_SIZE), desc="Inserting", unit="batch"):
         batch_end = min(i + BATCH_SIZE, num_vectors)
-        batch_data = [
-            (int(ids[j]), vectors[j].tolist())
-            for j in range(i, batch_end)
-        ]
+        batch_data = [(int(ids[j]), vectors[j].tolist()) for j in range(i, batch_end)]
 
         execute_values(
             cursor,
             "INSERT INTO vectors (id, embedding) VALUES %s",
             batch_data,
-            template="(%s, %s::vector)"
+            template="(%s, %s::vector)",
         )
 
         if (i + BATCH_SIZE) % 100_000 == 0:
@@ -105,10 +119,13 @@ def main():
     cursor.execute("SELECT COUNT(*) FROM vectors")
     count = cursor.fetchone()[0]
 
-    print(f"[Insert] Complete! {count:,} vectors in {elapsed:.2f}s ({count / elapsed:.0f} vectors/s)")
+    print(
+        f"[Insert] Complete! {count:,} vectors in {elapsed:.2f}s ({count / elapsed:.0f} vectors/s)"
+    )
 
     cursor.close()
     conn.close()
+
 
 if __name__ == "__main__":
     main()

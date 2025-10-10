@@ -11,6 +11,7 @@ from compute_baseline import compute_baseline
 from query_vectorchord import run_benchmark as run_vectorchord_benchmark
 from query_pgvectorscale import run_benchmark as run_pgvectorscale_benchmark
 
+
 def run_command(cmd, description):
     """Run a command and capture output."""
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -19,14 +20,15 @@ def run_command(cmd, description):
         sys.exit(1)
     return result
 
+
 def wait_for_db(max_attempts=30, delay=2):
     """Wait for database to be ready."""
     db_config = {
-        'host': 'localhost',
-        'port': 5432,
-        'dbname': 'postgres',
-        'user': 'postgres',
-        'password': 'postgres'
+        "host": "localhost",
+        "port": 5432,
+        "dbname": "postgres",
+        "user": "postgres",
+        "password": "postgres",
     }
 
     for attempt in range(max_attempts):
@@ -42,14 +44,15 @@ def wait_for_db(max_attempts=30, delay=2):
                 return False
     return False
 
+
 def check_table_count(expected_count):
     """Check if the vectors table has the expected number of rows."""
     db_config = {
-        'host': 'localhost',
-        'port': 5432,
-        'dbname': 'postgres',
-        'user': 'postgres',
-        'password': 'postgres'
+        "host": "localhost",
+        "port": 5432,
+        "dbname": "postgres",
+        "user": "postgres",
+        "password": "postgres",
     }
 
     try:
@@ -64,52 +67,77 @@ def check_table_count(expected_count):
         print(f"Error checking table count: {e}")
         return False
 
+
 def print_results_table(baseline_time, num_vectors, results):
     """Print formatted results table."""
-    print("\n" + "="*100)
-    print(f"# ANN Benchmark Results ({num_vectors//1000}K vectors)")
-    print("="*100)
+    print("\n" + "=" * 100)
+    print(f"# ANN Benchmark Results ({num_vectors // 1000}K vectors)")
+    print("=" * 100)
     print()
-    print("| Method | Query Latency (ms) | Retrieval Precision | Speedup vs Baseline | Index Build Time (s) | Index Size (MB) |")
-    print("|--------|-------------------|---------------------|---------------------|---------------------|-----------------|")
+    print(
+        "| Method | Query Latency (ms) | Retrieval recall | Speedup vs Baseline | Index Build Time (s) | Index Size (MB) |"
+    )
+    print(
+        "|--------|-------------------|---------------------|---------------------|---------------------|-----------------|"
+    )
 
     # Baseline row
-    print(f"| Baseline (Brute Force) | {baseline_time*1000:.2f} | 100.00% | 1.00x | - | - |")
+    print(
+        f"| Baseline (Brute Force) | {baseline_time * 1000:.2f} | 100.00% | 1.00x | - | - |"
+    )
 
     # Sort results by method name
-    for result in sorted(results, key=lambda x: x['method']):
-        method = result['method']
-        if method == 'vchordrq':
+    for result in sorted(results, key=lambda x: x["method"]):
+        method = result["method"]
+        if method == "vchordrq":
             display_name = "**VectorChord (vchordrq)**"
-        elif method == 'HNSW':
+        elif method == "HNSW":
             display_name = "**pgvectorscale (HNSW)**"
-        elif method == 'IVFFlat':
+        elif method == "IVFFlat":
             display_name = "**pgvectorscale (IVFFlat)**"
-        elif method == 'DiskANN':
+        elif method == "DiskANN":
             display_name = "**pgvectorscale (DiskANN)**"
         else:
             display_name = f"**{method}**"
 
-        latency_ms = result['latency'] * 1000
-        precision_pct = result['precision'] * 100
-        speedup = baseline_time / result['latency']
-        build_time = result['build_time']
-        size_mb = int(result['size_mb'])
+        latency_ms = result["latency"] * 1000
+        recall_pct = result["recall"] * 100
+        speedup = baseline_time / result["latency"]
+        build_time = result["build_time"]
+        size_mb = int(result["size_mb"])
 
-        print(f"| {display_name} | {latency_ms:.2f} | {precision_pct:.2f}% | {speedup:.2f}x | {build_time:.2f} | {size_mb} |")
+        print(
+            f"| {display_name} | {latency_ms:.2f} | {recall_pct:.2f}% | {speedup:.2f}x | {build_time:.2f} | {size_mb} |"
+        )
+
 
 def main():
-    parser = argparse.ArgumentParser(description="ANN Benchmark - pgvectorscale vs vectorchord")
-    parser.add_argument('--skip-pgvectorscale', action='store_true',
-                        help='Skip pgvectorscale benchmark')
-    parser.add_argument('--skip-vectorchord', action='store_true',
-                        help='Skip vectorchord benchmark')
-    parser.add_argument('--skip-insertion', action='store_true',
-                        help='Skip data insertion (run queries only)')
-    parser.add_argument('--num-vectors', type=int, default=100000,
-                        help='Number of vectors to generate and benchmark (default: 100000)')
-    parser.add_argument('--vectors-file', type=str, default=None,
-                        help='Path to .npy file containing pre-generated vectors (optional)')
+    parser = argparse.ArgumentParser(
+        description="ANN Benchmark - pgvectorscale vs vectorchord"
+    )
+    parser.add_argument(
+        "--skip-pgvectorscale", action="store_true", help="Skip pgvectorscale benchmark"
+    )
+    parser.add_argument(
+        "--skip-vectorchord", action="store_true", help="Skip vectorchord benchmark"
+    )
+    parser.add_argument(
+        "--skip-insertion",
+        action="store_true",
+        help="Skip data insertion (run queries only)",
+    )
+    parser.add_argument(
+        "--num-vectors",
+        type=int,
+        default=100000,
+        help="Number of vectors to generate and benchmark (default: 100000)",
+    )
+    parser.add_argument(
+        "--vectors-file",
+        type=str,
+        default=None,
+        help="Path to .npy file containing pre-generated vectors (optional)",
+    )
     args = parser.parse_args()
 
     print("\n=== ANN Benchmark: pgvectorscale vs vectorchord ===")
@@ -118,6 +146,7 @@ def main():
     dimensions = 512  # default
     if args.vectors_file:
         import numpy as np
+
         print(f"[Setup] Loading {args.vectors_file} to determine dimensions...")
         vectors = np.load(args.vectors_file)
         if vectors.ndim == 2:
@@ -128,9 +157,11 @@ def main():
             sys.exit(1)
 
     # Step 1: Generate query vector
-    if not os.path.exists('query.npy'):
+    if not os.path.exists("query.npy"):
         print(f"[Setup] Generating query vector with {dimensions} dimensions...")
-        run_command(f"python3 generate_data.py --dimensions {dimensions}", "Query generation")
+        run_command(
+            f"python3 generate_data.py --dimensions {dimensions}", "Query generation"
+        )
     else:
         print("[Setup] Using existing query.npy")
 
@@ -153,7 +184,9 @@ def main():
                 cmd += f" --vectors-file {args.vectors_file}"
             result = subprocess.run(cmd, shell=True)
             if result.returncode != 0:
-                print(f"Error: Data insertion failed with exit code {result.returncode}")
+                print(
+                    f"Error: Data insertion failed with exit code {result.returncode}"
+                )
                 sys.exit(1)
     else:
         print("[Setup] Skipping insertion (--skip-insertion)")
@@ -166,26 +199,23 @@ def main():
     # Step 5: Test vectorchord
     if not args.skip_vectorchord:
         result = run_vectorchord_benchmark(
-            baseline['query'],
-            baseline['baseline_ids'],
-            baseline['postgres_time']
+            baseline["query"], baseline["baseline_ids"], baseline["postgres_time"]
         )
         results.append(result)
 
     # Step 6: Test pgvectorscale
     if not args.skip_pgvectorscale:
         pgvectorscale_results = run_pgvectorscale_benchmark(
-            baseline['query'],
-            baseline['baseline_ids'],
-            baseline['postgres_time']
+            baseline["query"], baseline["baseline_ids"], baseline["postgres_time"]
         )
         results.extend(pgvectorscale_results)
 
     # Print final results table
     if results:
-        print_results_table(baseline['postgres_time'], args.num_vectors, results)
+        print_results_table(baseline["postgres_time"], args.num_vectors, results)
 
     print("Database container is still running. Stop with: docker compose stop")
+
 
 if __name__ == "__main__":
     main()
