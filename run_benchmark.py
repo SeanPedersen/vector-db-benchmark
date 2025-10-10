@@ -62,6 +62,7 @@ def check_table_count(expected_count):
         count = cursor.fetchone()[0]
         cursor.close()
         conn.close()
+        print(f"Table contains {count:,} vectors")
         return count == expected_count
     except Exception as e:
         print(f"Error checking table count: {e}")
@@ -176,7 +177,7 @@ def main():
     if not args.skip_insertion:
         # Check if table already has the correct number of vectors
         if check_table_count(args.num_vectors):
-            print(f"[Setup] Table already contains {args.num_vectors:,} vectors")
+            print(f"[Setup] Table already contains {args.num_vectors:,} vectors, skipping insertion")
         else:
             # Run insertion with live output (no capture) so user can see progress
             cmd = f"python3 insert.py --num-vectors {args.num_vectors} --dimensions {dimensions}"
