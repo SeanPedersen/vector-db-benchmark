@@ -249,7 +249,6 @@ def run_benchmark(query, baseline_ids, baseline_time):
             search_list_size = {search_list_size},
             max_alpha = {max_alpha},
             storage_layout = '{storage_layout}',
-            num_dimensions = 512
         )
     """)
     conn.commit()
