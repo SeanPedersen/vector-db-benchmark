@@ -32,11 +32,7 @@ def benchmark_index(
     index_type,
     query_str,
     baseline_ids,
-    baseline_time,
-    db_size,
-    table_size,
     probes=None,
-    diskann_params=None,
     hnsw_ef=None,
 ):
     """Run benchmark for a specific index."""
@@ -134,47 +130,14 @@ def run_benchmark(query, baseline_ids, baseline_time):
     cursor.execute("DROP INDEX IF EXISTS idx_vectors_embedding_diskann")
     conn.commit()
 
-    # Calculate optimal DiskANN parameters based on dataset size
-    if num_vectors < 1_042:
-        num_neighbors = 32
-        search_list_size = 50
-        max_alpha = 1.0
-    elif num_vectors < 1_000_042:
-        num_neighbors = 50
-        search_list_size = 100
-        max_alpha = 1.0
-    elif num_vectors < 100_000_000:
-        num_neighbors = 100
-        search_list_size = 200
-        max_alpha = 1.2
-    else:
-        num_neighbors = 200
-        search_list_size = 500
-        max_alpha = 1.5
-
-    storage_layout = "memory_optimized"
-
     index_start = time.time()
     cursor.execute(f"""
         CREATE INDEX idx_vectors_embedding_diskann
         ON vectors USING diskann (embedding vector_cosine_ops)
-        WITH (
-            num_neighbors = {num_neighbors},
-            search_list_size = {search_list_size},
-            max_alpha = {max_alpha},
-            storage_layout = '{storage_layout}'
-        )
     """)
     conn.commit()
     diskann_index_time = time.time() - index_start
     print(f"[pgvectorscale] DiskANN index built in {diskann_index_time:.2f}s")
-
-    diskann_params = {
-        "num_neighbors": num_neighbors,
-        "search_list_size": search_list_size,
-        "max_alpha": max_alpha,
-        "storage_layout": storage_layout,
-    }
 
     diskann_result = benchmark_index(
         cursor,
@@ -185,7 +148,6 @@ def run_benchmark(query, baseline_ids, baseline_time):
         baseline_time,
         db_size,
         table_size,
-        diskann_params=diskann_params,
     )
 
     results.append(("DiskANN", diskann_result, diskann_index_time))
