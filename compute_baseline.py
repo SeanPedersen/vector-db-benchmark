@@ -35,14 +35,15 @@ def compute_baseline():
     # Baseline 1: NumPy brute force (load all vectors from DB)
     load_start = time.time()
 
-    if count > 100000:
+    # Always use batched approach for debugging
+    if True:  # count > 100000:
         # Process in batches to save memory
         num_batches = 10
         batch_size = (count + num_batches - 1) // num_batches  # Ceiling division
         print(f"[Baseline] Processing {count:,} vectors in {num_batches} batches of ~{batch_size:,} vectors each")
 
-        all_top_k_ids = []
-        all_top_k_similarities = []
+        all_ids = []
+        all_similarities = []
 
         compute_elapsed = 0
 
@@ -64,28 +65,35 @@ def compute_baseline():
                 for row in rows
             ], dtype=np.float32)
 
+            # Normalize vectors for cosine similarity (Postgres does this automatically)
+            norms = np.linalg.norm(batch_vectors, axis=1, keepdims=True)
+            batch_vectors = batch_vectors / norms
+
             # Compute cosine similarities for this batch
             compute_start = time.time()
             batch_similarities = np.dot(batch_vectors, query)
-
-            # Get top K from this batch
-            batch_top_k_indices = np.argsort(batch_similarities)[::-1][:K_NEIGHBORS]
-            batch_top_k_ids = batch_ids[batch_top_k_indices]
-            batch_top_k_similarities = batch_similarities[batch_top_k_indices]
             compute_elapsed += time.time() - compute_start
 
-            all_top_k_ids.append(batch_top_k_ids)
-            all_top_k_similarities.append(batch_top_k_similarities)
+            all_ids.append(batch_ids)
+            all_similarities.append(batch_similarities)
 
         # Combine all batch results and find global top K
         compute_start = time.time()
-        all_top_k_ids = np.concatenate(all_top_k_ids)
-        all_top_k_similarities = np.concatenate(all_top_k_similarities)
+        all_ids = np.concatenate(all_ids)
+        all_similarities = np.concatenate(all_similarities)
 
-        # Get final top K
-        final_top_k_indices = np.argsort(all_top_k_similarities)[::-1][:K_NEIGHBORS]
-        top_k_ids = all_top_k_ids[final_top_k_indices]
-        top_k_similarities = all_top_k_similarities[final_top_k_indices]
+        # Debug: Check if we have the expected number of vectors
+        print(f"[Baseline] DEBUG: Total vectors after concatenation: {len(all_ids)}")
+        print(f"[Baseline] DEBUG: Min/Max similarity: {all_similarities.min():.6f} / {all_similarities.max():.6f}")
+
+        # Get final top K from all vectors
+        final_top_k_indices = np.argsort(all_similarities)[::-1][:K_NEIGHBORS]
+        top_k_ids = all_ids[final_top_k_indices]
+        top_k_similarities = all_similarities[final_top_k_indices]
+
+        # Debug: Print top 10 similarities
+        print(f"[Baseline] DEBUG: Top 10 similarities: {top_k_similarities[:10]}")
+
         compute_elapsed += time.time() - compute_start
 
         load_elapsed = time.time() - load_start
@@ -104,6 +112,10 @@ def compute_baseline():
         load_elapsed = time.time() - load_start
 
         compute_start = time.time()
+        # Normalize vectors for cosine similarity (Postgres does this automatically)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        vectors = vectors / norms
+
         # Compute cosine similarities (dot product for normalized vectors)
         similarities = np.dot(vectors, query)
 
@@ -159,6 +171,9 @@ def compute_baseline():
     pg_ids = np.array([row[0] for row in pg_results], dtype=np.int64)
     pg_similarities = np.array([row[1] for row in pg_results], dtype=np.float64)
 
+    # Debug: Print Postgres top 10 similarities
+    print(f"[Baseline] DEBUG: Postgres top 10 similarities: {pg_similarities[:10]}")
+
     # Compare results
     matches = np.sum(np.isin(pg_ids, top_k_ids))
     recall = matches / K_NEIGHBORS
@@ -170,9 +185,12 @@ def compute_baseline():
     elif recall >= 0.95:
         print(f"[Baseline] NumPy and Postgres mostly match: {matches}/{K_NEIGHBORS} ({recall*100:.1f}% - likely due to floating point precision)")
     else:
-        print(f"[Baseline] WARNING: Results differ significantly - {matches}/{K_NEIGHBORS} match ({recall*100:.1f}% recall)")
+        print(f"[Baseline] ERROR: Results differ significantly - {matches}/{K_NEIGHBORS} match ({recall*100:.1f}% recall)")
         print(f"[Baseline] Top 10 NumPy IDs: {top_k_ids[:10].tolist()}")
         print(f"[Baseline] Top 10 Postgres IDs: {pg_ids[:10].tolist()}")
+        cursor.close()
+        conn.close()
+        raise ValueError(f"Baseline mismatch: NumPy and Postgres results differ ({recall*100:.1f}% recall). Cannot proceed with benchmark.")
 
     cursor.close()
     conn.close()

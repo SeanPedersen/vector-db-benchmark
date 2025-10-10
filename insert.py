@@ -17,17 +17,16 @@ DB_CONFIG = {
 }
 
 BATCH_SIZE = 10_000
-DIMENSIONS = 512
 
-def generate_vectors(num_vectors):
+def generate_vectors(num_vectors, dimensions):
     """Generate normalized random vectors."""
-    print(f"Generating {num_vectors:,} random vectors of dimension {DIMENSIONS}...")
+    print(f"Generating {num_vectors:,} random vectors of dimension {dimensions}...")
 
     # Set seed for reproducibility
     np.random.seed(42)
 
     # Generate random vectors (float32)
-    vectors = np.random.randn(num_vectors, DIMENSIONS).astype(np.float32)
+    vectors = np.random.randn(num_vectors, dimensions).astype(np.float32)
 
     # Normalize vectors for cosine similarity
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
@@ -39,31 +38,43 @@ def main():
     parser = argparse.ArgumentParser(description="Generate and insert vectors into database")
     parser.add_argument('--num-vectors', type=int, default=100000,
                         help='Number of vectors to generate (default: 100000)')
+    parser.add_argument('--dimensions', type=int, default=512,
+                        help='Vector dimensions (default: 512)')
+    parser.add_argument('--vectors-file', type=str, default=None,
+                        help='Path to .npy file containing pre-generated vectors (optional)')
     args = parser.parse_args()
 
     num_vectors = args.num_vectors
+    dimensions = args.dimensions
 
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
-    # Check if table already has the correct number of vectors
-    cursor.execute("SELECT COUNT(*) FROM vectors")
-    existing_count = cursor.fetchone()[0]
+    # Load or generate vectors first to determine dimensions
+    if args.vectors_file:
+        print(f"[Insert] Loading vectors from {args.vectors_file}...")
+        vectors = np.load(args.vectors_file)
 
-    if existing_count == num_vectors:
-        print(f"\n[Insert] Table already contains {existing_count:,} vectors. Skipping insertion.")
-        cursor.close()
-        conn.close()
-        return
+        # Validate shape
+        if vectors.ndim != 2:
+            print(f"Error: Expected 2D array of shape (N, D), got {vectors.ndim}D array with shape {vectors.shape}")
+            cursor.close()
+            conn.close()
+            return
 
-    # Clear existing data if count doesn't match
-    if existing_count > 0:
-        print(f"\n[Insert] Clearing existing {existing_count:,} vectors...")
-        cursor.execute("TRUNCATE TABLE vectors")
-        conn.commit()
+        # Use actual dimensions and count from file
+        num_vectors = vectors.shape[0]
+        dimensions = vectors.shape[1]
+        print(f"[Insert] Loaded {num_vectors:,} vectors with dimension {dimensions}")
+    else:
+        vectors = generate_vectors(num_vectors, dimensions)
 
-    # Generate vectors
-    vectors = generate_vectors(num_vectors)
+    # Create or recreate table with correct dimensions
+    print(f"[Insert] Creating table for {dimensions}-dimensional vectors...")
+    cursor.execute("DROP TABLE IF EXISTS vectors")
+    cursor.execute(f"CREATE TABLE vectors (id BIGINT PRIMARY KEY, embedding vector({dimensions}))")
+    conn.commit()
+
     ids = np.arange(num_vectors, dtype=np.int64)
 
     print(f"[Insert] Inserting {num_vectors:,} vectors...")

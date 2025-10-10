@@ -108,14 +108,29 @@ def main():
                         help='Skip data insertion (run queries only)')
     parser.add_argument('--num-vectors', type=int, default=100000,
                         help='Number of vectors to generate and benchmark (default: 100000)')
+    parser.add_argument('--vectors-file', type=str, default=None,
+                        help='Path to .npy file containing pre-generated vectors (optional)')
     args = parser.parse_args()
 
     print("\n=== ANN Benchmark: pgvectorscale vs vectorchord ===")
 
+    # Determine dimensions from vectors file if provided
+    dimensions = 512  # default
+    if args.vectors_file:
+        import numpy as np
+        print(f"[Setup] Loading {args.vectors_file} to determine dimensions...")
+        vectors = np.load(args.vectors_file)
+        if vectors.ndim == 2:
+            dimensions = vectors.shape[1]
+            print(f"[Setup] Detected {dimensions} dimensions from vectors file")
+        else:
+            print(f"Error: Invalid vectors file shape {vectors.shape}")
+            sys.exit(1)
+
     # Step 1: Generate query vector
     if not os.path.exists('query.npy'):
-        print("[Setup] Generating query vector...")
-        run_command("python3 generate_data.py", "Query generation")
+        print(f"[Setup] Generating query vector with {dimensions} dimensions...")
+        run_command(f"python3 generate_data.py --dimensions {dimensions}", "Query generation")
     else:
         print("[Setup] Using existing query.npy")
 
@@ -133,7 +148,10 @@ def main():
             print(f"[Setup] Table already contains {args.num_vectors:,} vectors")
         else:
             # Run insertion with live output (no capture) so user can see progress
-            result = subprocess.run(f"python3 insert.py --num-vectors {args.num_vectors}", shell=True)
+            cmd = f"python3 insert.py --num-vectors {args.num_vectors} --dimensions {dimensions}"
+            if args.vectors_file:
+                cmd += f" --vectors-file {args.vectors_file}"
+            result = subprocess.run(cmd, shell=True)
             if result.returncode != 0:
                 print(f"Error: Data insertion failed with exit code {result.returncode}")
                 sys.exit(1)
