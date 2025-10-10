@@ -84,6 +84,24 @@ def main():
     else:
         vectors = generate_vectors(num_vectors, dimensions)
 
+    # Check if table exists and has the correct count
+    table_exists = False
+    correct_count = False
+    try:
+        cursor.execute("SELECT COUNT(*) FROM vectors")
+        existing_count = cursor.fetchone()[0]
+        table_exists = True
+        if existing_count == num_vectors:
+            correct_count = True
+            print(f"[Insert] Table already contains {existing_count:,} vectors, skipping insertion")
+    except psycopg2.Error:
+        table_exists = False
+
+    if correct_count:
+        cursor.close()
+        conn.close()
+        return
+
     # Create or recreate table with correct dimensions
     print(f"[Insert] Creating table for {dimensions}-dimensional vectors...")
     cursor.execute("DROP TABLE IF EXISTS vectors")

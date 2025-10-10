@@ -145,9 +145,6 @@ def run_benchmark(query, baseline_ids, baseline_time):
         "DiskANN",
         query_str,
         baseline_ids,
-        baseline_time,
-        db_size,
-        table_size,
     )
 
     results.append(("DiskANN", diskann_result, diskann_index_time))
@@ -187,9 +184,6 @@ def run_benchmark(query, baseline_ids, baseline_time):
         "HNSW",
         query_str,
         baseline_ids,
-        baseline_time,
-        db_size,
-        table_size,
         hnsw_ef=ef_search,
     )
 
@@ -227,9 +221,6 @@ def run_benchmark(query, baseline_ids, baseline_time):
         "IVFFlat",
         query_str,
         baseline_ids,
-        baseline_time,
-        db_size,
-        table_size,
         probes=probes,
     )
 

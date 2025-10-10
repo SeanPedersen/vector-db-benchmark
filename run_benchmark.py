@@ -152,7 +152,8 @@ def main():
         vectors = np.load(args.vectors_file)
         if vectors.ndim == 2:
             dimensions = vectors.shape[1]
-            print(f"[Setup] Detected {dimensions} dimensions from vectors file")
+            args.num_vectors = vectors.shape[0]  # Update num_vectors from file
+            print(f"[Setup] Detected {args.num_vectors:,} vectors with {dimensions} dimensions from vectors file")
         else:
             print(f"Error: Invalid vectors file shape {vectors.shape}")
             sys.exit(1)
