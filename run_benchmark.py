@@ -92,9 +92,9 @@ def print_results_table(baseline_time, num_vectors, results):
         if method == "vchordrq":
             display_name = "**VectorChord (vchordrq)**"
         elif method == "HNSW":
-            display_name = "**pgvectorscale (HNSW)**"
+            display_name = "**pgvector (HNSW)**"
         elif method == "IVFFlat":
-            display_name = "**pgvectorscale (IVFFlat)**"
+            display_name = "**pgvector (IVFFlat)**"
         elif method == "DiskANN":
             display_name = "**pgvectorscale (DiskANN)**"
         else:
