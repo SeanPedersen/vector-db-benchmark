@@ -162,7 +162,7 @@ def run_benchmark(query, baseline_ids, baseline_time):
             num_neighbors = {num_neighbors},
             search_list_size = {search_list_size},
             max_alpha = {max_alpha},
-            storage_layout = '{storage_layout}',
+            storage_layout = '{storage_layout}'
         )
     """)
     conn.commit()
