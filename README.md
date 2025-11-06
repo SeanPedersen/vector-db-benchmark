@@ -6,5 +6,4 @@ Compare ANN indices: pgvectorscale hnsw, ivfflat, diskann with vectorchord vchor
 
 - Activate uv env
 - Start benchmark: $ python run_benchmark.py
-- Remove saved NPY files (vectors etc.): $ rm *.npy
 - Reset DB's: $ bash reset_databases.sh
