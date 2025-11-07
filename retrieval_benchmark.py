@@ -749,81 +749,6 @@ def query_index(
                 cursor.execute("SET enable_seqscan = on")
             except Exception:
                 pass
-    elif kind == "binary_exact_np10":
-        # Exact binary candidate generation with fixed 10x overfetch, SQL rerank in-db
-        cast_type = "vector" if precision == "vector" else "halfvec"
-
-        if use_uint8_bin:
-            bin_col = "embedding_bin_uint8"
-            query_bin_str = query_bin_uint8_str
-            bin_dim = dim * 8
-            sql = f"""
-            SELECT t.id
-            FROM (
-              SELECT id
-              FROM {table}
-              ORDER BY {bin_col} <~> %s::bit({bin_dim})
-              LIMIT {K * 10}
-            ) c
-            JOIN {table} t USING(id)
-            ORDER BY t.embedding <=> %s::{cast_type}
-            LIMIT {K}
-            """
-            params = (query_bin_str, query_txt)
-        elif use_mean_bin:
-            bin_col = "embedding_bin_mean"
-            query_bin_str = query_bin_mean_str
-            sql = f"""
-            SELECT t.id
-            FROM (
-              SELECT id
-              FROM {table}
-              ORDER BY {bin_col} <~> %s::bit({dim})
-              LIMIT {K * 10}
-            ) c
-            JOIN {table} t USING(id)
-            ORDER BY t.embedding <=> %s::{cast_type}
-            LIMIT {K}
-            """
-            params = (query_bin_str, query_txt)
-        else:
-            sql = f"""
-            SELECT t.id
-            FROM (
-              SELECT id
-              FROM {table}
-              ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
-              LIMIT {K * 10}
-            ) c
-            JOIN {table} t USING(id)
-            ORDER BY t.embedding <=> %s::{cast_type}
-            LIMIT {K}
-            """
-            params = (query_txt, query_txt)
-
-        try:
-            cursor.execute("SET enable_indexscan = off")
-            cursor.execute("SET enable_bitmapscan = off")
-            cursor.execute("SET enable_indexonlyscan = off")
-            cursor.execute("SET enable_seqscan = on")
-
-            # Warm-up
-            cursor.execute(sql, params)
-            cursor.fetchall()
-
-            start = time.time()
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-            retrieved = [int(r[0]) for r in rows]
-            latency = time.time() - start
-        finally:
-            try:
-                cursor.execute("SET enable_indexscan = on")
-                cursor.execute("SET enable_bitmapscan = on")
-                cursor.execute("SET enable_indexonlyscan = on")
-                cursor.execute("SET enable_seqscan = on")
-            except Exception:
-                pass
     elif kind == "exact":
         # Exact retrieval via sequential scan (no index usage)
         try:
@@ -1671,28 +1596,6 @@ def main():
                 baseline_ids,
             )
 
-            # New: exact-binary NumPy rerank with fixed 10x overfetch
-            print(f"[Query] Exact binary NumPy rerank float32 (10x overfetch)...")
-            lat_bin_exact_np10_vec, rec_bin_exact_np10_vec = query_index(
-                conn,
-                tbl_vector,
-                "vector",
-                "binary_exact_np10",
-                dim,
-                query_trunc,
-                baseline_ids,
-            )
-            print(f"[Query] Exact binary NumPy rerank float16 (10x overfetch)...")
-            lat_bin_exact_np10_half, rec_bin_exact_np10_half = query_index(
-                conn,
-                tbl_half,
-                "halfvec",
-                "binary_exact_np10",
-                dim,
-                query_trunc,
-                baseline_ids,
-            )
-
             # Keep exact-binary (1x) for reference (no rerank; pure Hamming)
             print(f"[Query] Exact binary float32 (1x, no rerank)...")
             lat_bin_exact_k_vec, rec_bin_exact_k_vec = query_index(
@@ -1744,6 +1647,33 @@ def main():
                     baseline_ids,
                     use_mean_bin=True,
                     dimension_means=dimension_means_1024,
+                )
+
+            if args.enable_quasi_uint8:
+                # Quasi-uint8 binary exact queries (no rerank - pure Hamming on 8xN bits)
+                print(f"[Query] Exact binary UINT8 float32 (1x, no rerank)...")
+                lat_bin_exact_uint8_vec, rec_bin_exact_uint8_vec = query_index(
+                    conn,
+                    tbl_vector,
+                    "vector",
+                    "binary_exact_k",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    use_uint8_bin=True,
+                    uint8_thresholds=uint8_thresholds_1024,
+                )
+                print(f"[Query] Exact binary UINT8 float16 (1x, no rerank)...")
+                lat_bin_exact_uint8_half, rec_bin_exact_uint8_half = query_index(
+                    conn,
+                    tbl_half,
+                    "halfvec",
+                    "binary_exact_k",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    use_uint8_bin=True,
+                    uint8_thresholds=uint8_thresholds_1024,
                 )
 
         # Exact (sequential) queries
@@ -2014,30 +1944,6 @@ def main():
                 {
                     "dim": dim,
                     "storage": "float32",
-                    "index": "exact-binary+numpy(10x)",
-                    "lat_ms": lat_bin_exact_np10_vec * 1000,
-                    "recall": rec_bin_exact_np10_vec,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_vec_mb,
-                }
-            )
-            results.append(
-                {
-                    "dim": dim,
-                    "storage": "float16",
-                    "index": "exact-binary+numpy(10x)",
-                    "lat_ms": lat_bin_exact_np10_half * 1000,
-                    "recall": rec_bin_exact_np10_half,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_half_mb,
-                }
-            )
-            results.append(
-                {
-                    "dim": dim,
-                    "storage": "float32",
                     "index": "exact-binary(1x)",
                     "lat_ms": lat_bin_exact_k_vec * 1000,
                     "recall": rec_bin_exact_k_vec,
@@ -2079,6 +1985,32 @@ def main():
                         "index": f"exact-binary-mean({OVERFETCH_FACTOR}x)",
                         "lat_ms": lat_bin_exact_half_mean * 1000,
                         "recall": rec_bin_exact_half_mean,
+                        "build_s": 0.0,
+                        "index_mb": 0.0,
+                        "storage_mb": storage_half_mb,
+                    }
+                )
+
+            if args.enable_quasi_uint8:
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float32",
+                        "index": "exact-binary-uint8(1x)",
+                        "lat_ms": lat_bin_exact_uint8_vec * 1000,
+                        "recall": rec_bin_exact_uint8_vec,
+                        "build_s": 0.0,
+                        "index_mb": 0.0,
+                        "storage_mb": storage_vec_mb,
+                    }
+                )
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float16",
+                        "index": "exact-binary-uint8(1x)",
+                        "lat_ms": lat_bin_exact_uint8_half * 1000,
+                        "recall": rec_bin_exact_uint8_half,
                         "build_s": 0.0,
                         "index_mb": 0.0,
                         "storage_mb": storage_half_mb,
