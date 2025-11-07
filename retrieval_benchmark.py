@@ -789,22 +789,16 @@ def main():
         action="append",
         choices=[
             "vchordrq",
-            "vchord",
             "ivfflat",
-            "ivf",
             "binary-hnsw",
-            "hnsw-bin",
             "binary-ivf",
-            "ivf-bin",
             "binary-exact",
-            "exact-bin",
             "exact",
             "all",
         ],
         help=(
             "Benchmarks to run (can be specified multiple times). "
-            "Available: vchordrq/vchord, ivfflat/ivf, binary-hnsw/hnsw-bin, "
-            "binary-ivf/ivf-bin, binary-exact/exact-bin, exact, all. "
+            "Available: vchordrq, ivfflat, binary-hnsw, binary-ivf, binary-exact, exact, all. "
             "Default: all benchmarks if not specified."
         ),
     )
@@ -816,9 +810,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Process benchmark selection
+    # Process benchmark selection (aliases removed; only explicit names kept)
     if args.benchmark is None or "all" in args.benchmark:
-        # Default: run all benchmarks
         benchmarks = {
             "vchordrq",
             "ivfflat",
@@ -828,21 +821,7 @@ def main():
             "exact",
         }
     else:
-        # Normalize benchmark names (handle aliases)
-        benchmarks = set()
-        for b in args.benchmark:
-            if b in ("vchordrq", "vchord"):
-                benchmarks.add("vchordrq")
-            elif b in ("ivfflat", "ivf"):
-                benchmarks.add("ivfflat")
-            elif b in ("binary-hnsw", "hnsw-bin"):
-                benchmarks.add("binary-hnsw")
-            elif b in ("binary-ivf", "ivf-bin"):
-                benchmarks.add("binary-ivf")
-            elif b in ("binary-exact", "exact-bin"):
-                benchmarks.add("binary-exact")
-            elif b == "exact":
-                benchmarks.add("exact")
+        benchmarks = set(args.benchmark)
 
     print(f"[Setup] Running benchmarks: {', '.join(sorted(benchmarks))}")
 
