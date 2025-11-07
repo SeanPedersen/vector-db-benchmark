@@ -813,13 +813,14 @@ def main():
             conn, tbl_half, "halfvec", "binary_ivf_k", dim, query_trunc, baseline_ids
         )
 
-        print(f"[Query] Exact binary float32 rerank (1x overfetch)...")
-        lat_bin_exact_k_vec, rec_bin_exact_k_vec = query_index(
-            conn, tbl_vector, "vector", "binary_exact_k", dim, query_trunc, baseline_ids
+        # Add back exact retrieval (sequential, no index) so variables exist for results
+        print("[Query] Exact float32 (sequential, no index)...")
+        lat_exact_vec, rec_exact_vec = query_index(
+            conn, tbl_vector, "vector", "exact", dim, query_trunc, baseline_ids
         )
-        print(f"[Query] Exact binary float16 rerank (1x overfetch)...")
-        lat_bin_exact_k_half, rec_bin_exact_k_half = query_index(
-            conn, tbl_half, "halfvec", "binary_exact_k", dim, query_trunc, baseline_ids
+        print("[Query] Exact float16 (sequential, no index)...")
+        lat_exact_half, rec_exact_half = query_index(
+            conn, tbl_half, "halfvec", "exact", dim, query_trunc, baseline_ids
         )
 
         # Calculate storage sizes
