@@ -55,6 +55,8 @@ HNSW_EF_SEARCH = 1500  # HNSW ef_search parameter for binary index (raise defaul
 # NEW: HNSW build parameters (recommended: M ~ 16-48, ef_construction ~ 200-400)
 HNSW_M = 32
 HNSW_EF_CONSTRUCTION = 300
+# NEW: upper cap for hnsw.ef_search to satisfy server limits (e.g., 1..1000)
+HNSW_EF_SEARCH_MAX = 1000
 
 
 # NEW: simple heuristic for IVFFlat params based on dataset size (N) and k
@@ -302,8 +304,8 @@ def query_index(
         if "ivf" in kind:
             cursor.execute(f"SET ivfflat.probes = {IVF_PROBES_BINARY}")
         else:
-            # NEW: ensure ef_search >= overfetch for better recall
-            eff = max(HNSW_EF_SEARCH, overfetch)
+            # NEW: ensure ef_search >= overfetch for better recall, but clamp to server cap
+            eff = min(max(HNSW_EF_SEARCH, overfetch), HNSW_EF_SEARCH_MAX)
             cursor.execute(f"SET hnsw.ef_search = {eff}")
 
         cand_sql = f"""
@@ -542,7 +544,7 @@ def get_vector_storage_mb(num_vectors: int, dimensions: int, precision: str):
 
 
 def main():
-    global IVF_LISTS, IVF_PROBES, IVF_PROBES_BINARY, HNSW_EF_SEARCH, OVERFETCH_FACTOR, HNSW_M, HNSW_EF_CONSTRUCTION, K  # NEW: make K configurable
+    global IVF_LISTS, IVF_PROBES, IVF_PROBES_BINARY, HNSW_EF_SEARCH, OVERFETCH_FACTOR, HNSW_M, HNSW_EF_CONSTRUCTION, K, HNSW_EF_SEARCH_MAX  # NEW: include HNSW_EF_SEARCH_MAX
 
     parser = argparse.ArgumentParser(description="Retrieval benchmark (TASK.md)")
     parser.add_argument(
@@ -590,6 +592,13 @@ def main():
         type=int,
         default=1500,
         help="HNSW ef_search for binary index (should be >= overfetch; default: 1500)",
+    )
+    # NEW: cap for ef_search to satisfy server GUC range
+    parser.add_argument(
+        "--hnsw-ef-search-max",
+        type=int,
+        default=1000,
+        help="Upper cap for hnsw.ef_search to satisfy server limits (default: 1000)",
     )
     # NEW: HNSW build knobs
     parser.add_argument(
@@ -650,15 +659,14 @@ def main():
     OVERFETCH_FACTOR = args.overfetch
     HNSW_M = args.hnsw_m
     HNSW_EF_CONSTRUCTION = args.hnsw_ef_construction
-    # Ensure ef_search >= overfetch (k) per HNSW guidance
+    # Ensure ef_search >= overfetch (k) per HNSW guidance, but clamp to server cap
     required_ef = K * OVERFETCH_FACTOR
-    if args.hnsw_ef_search < required_ef:
+    desired_ef = max(args.hnsw_ef_search, required_ef)
+    if desired_ef > HNSW_EF_SEARCH_MAX:
         print(
-            f"[Params] Adjusting hnsw_ef_search from {args.hnsw_ef_search} -> {required_ef} to match overfetch"
+            f"[Params] Capping hnsw_ef_search at {HNSW_EF_SEARCH_MAX} (requested {desired_ef}) to satisfy server range"
         )
-        HNSW_EF_SEARCH = required_ef
-    else:
-        HNSW_EF_SEARCH = args.hnsw_ef_search
+    HNSW_EF_SEARCH = min(desired_ef, HNSW_EF_SEARCH_MAX)
 
     # Load or generate embeddings
     if args.vectors_file:
@@ -723,7 +731,8 @@ def main():
 
     print(
         f"[Params] k={K} | IVF: lists={IVF_LISTS}, probes={IVF_PROBES} (binary: {IVF_PROBES_BINARY}) | "
-        f"Binary/HNSW: overfetch={OVERFETCH_FACTOR}x, m={HNSW_M}, ef_construction={HNSW_EF_CONSTRUCTION}, ef_search={HNSW_EF_SEARCH}"
+        f"Binary/HNSW: overfetch={OVERFETCH_FACTOR}x, m={HNSW_M}, ef_construction={HNSW_EF_CONSTRUCTION}, "
+        f"ef_search={HNSW_EF_SEARCH}, ef_search_cap={HNSW_EF_SEARCH_MAX}"
     )
 
     # NEW: concise IVFFlat tuning guidance for ~50K vectors and k≈1000
