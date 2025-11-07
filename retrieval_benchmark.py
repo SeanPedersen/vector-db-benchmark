@@ -57,6 +57,24 @@ HNSW_M = 32
 HNSW_EF_CONSTRUCTION = 300
 
 
+# NEW: simple heuristic for IVFFlat params based on dataset size (N) and k
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def recommend_ivf_params(num_vectors: int, k: int):
+    """
+    Heuristics:
+    - lists in [50, 500], target ~ N/200 (e.g., 50K -> 250)
+    - probes ~ lists/12, clamped to [10, 50] (e.g., 250 -> ~20)
+    - binary probes ~ 3x probes, clamped to [30, 200]
+    """
+    lists = _clamp(num_vectors // 200, 50, 500)
+    probes = _clamp(round(lists / 12), 10, 50)
+    probes_bin = _clamp(probes * 3, 30, 200)
+    return int(lists), int(probes), int(probes_bin)
+
+
 def generate_embeddings(num_vectors: int, full_dim: int = 1024):
     np.random.seed(123)
     data = np.random.randn(num_vectors, full_dim).astype(np.float32)
@@ -524,14 +542,7 @@ def get_vector_storage_mb(num_vectors: int, dimensions: int, precision: str):
 
 
 def main():
-    global \
-        IVF_LISTS, \
-        IVF_PROBES, \
-        IVF_PROBES_BINARY, \
-        HNSW_EF_SEARCH, \
-        OVERFETCH_FACTOR, \
-        HNSW_M, \
-        HNSW_EF_CONSTRUCTION
+    global IVF_LISTS, IVF_PROBES, IVF_PROBES_BINARY, HNSW_EF_SEARCH, OVERFETCH_FACTOR, HNSW_M, HNSW_EF_CONSTRUCTION, K  # NEW: make K configurable
 
     parser = argparse.ArgumentParser(description="Retrieval benchmark (TASK.md)")
     parser.add_argument(
@@ -548,20 +559,31 @@ def main():
         type=int,
         help="(Deprecated, use --size) Number of vectors to generate",
     )
+    # NEW: allow configuring k (neighbors to retrieve)
     parser.add_argument(
-        "--ivf-lists", type=int, default=100, help="IVF lists parameter (default: 100)"
+        "--k",
+        type=int,
+        default=1000,
+        help="Number of nearest neighbors to retrieve (default: 1000)",
+    )
+    # NEW: make IVFFlat params optional to enable auto-tuning
+    parser.add_argument(
+        "--ivf-lists",
+        type=int,
+        default=None,
+        help="IVF lists; if omitted, auto-tuned from dataset size and k",
     )
     parser.add_argument(
         "--ivf-probes",
         type=int,
-        default=10,
-        help="IVF probes parameter for non-binary (default: 10)",
+        default=None,
+        help="IVF probes for non-binary; if omitted, auto-tuned",
     )
     parser.add_argument(
         "--ivf-probes-binary",
         type=int,
-        default=50,
-        help="IVF probes for binary indices (default: 50)",
+        default=None,
+        help="IVF probes for binary; if omitted, auto-tuned",
     )
     parser.add_argument(
         "--hnsw-ef-search",
@@ -602,10 +624,29 @@ def main():
     else:
         num_vectors = args.size
 
-    # Update global parameters from args
-    IVF_LISTS = args.ivf_lists
-    IVF_PROBES = args.ivf_probes
-    IVF_PROBES_BINARY = args.ivf_probes_binary
+    # NEW: set global K from CLI
+    K = args.k
+
+    # Update global parameters from args (with auto-tuning for IVFFlat)
+    if (
+        args.ivf_lists is None
+        or args.ivf_probes is None
+        or args.ivf_probes_binary is None
+    ):
+        rec_lists, rec_probes, rec_probes_bin = recommend_ivf_params(num_vectors, K)
+        IVF_LISTS = rec_lists if args.ivf_lists is None else args.ivf_lists
+        IVF_PROBES = rec_probes if args.ivf_probes is None else args.ivf_probes
+        IVF_PROBES_BINARY = (
+            rec_probes_bin if args.ivf_probes_binary is None else args.ivf_probes_binary
+        )
+        print(
+            f"[Params] IVFFlat auto: lists={IVF_LISTS}, probes={IVF_PROBES}, probes_binary={IVF_PROBES_BINARY} (N={num_vectors:,}, k={K})"
+        )
+    else:
+        IVF_LISTS = args.ivf_lists
+        IVF_PROBES = args.ivf_probes
+        IVF_PROBES_BINARY = args.ivf_probes_binary
+
     OVERFETCH_FACTOR = args.overfetch
     HNSW_M = args.hnsw_m
     HNSW_EF_CONSTRUCTION = args.hnsw_ef_construction
@@ -681,9 +722,18 @@ def main():
     )
 
     print(
-        f"[Params] IVF: lists={IVF_LISTS}, probes={IVF_PROBES} (binary: {IVF_PROBES_BINARY}) | "
+        f"[Params] k={K} | IVF: lists={IVF_LISTS}, probes={IVF_PROBES} (binary: {IVF_PROBES_BINARY}) | "
         f"Binary/HNSW: overfetch={OVERFETCH_FACTOR}x, m={HNSW_M}, ef_construction={HNSW_EF_CONSTRUCTION}, ef_search={HNSW_EF_SEARCH}"
     )
+
+    # NEW: concise IVFFlat tuning guidance for ~50K vectors and k≈1000
+    if num_vectors >= 50000 and K >= 1000:
+        print(
+            "[Tips] IVFFlat: with ~50K vectors and k≈1000, try lists in [50, 500] (e.g., 200–300) and probes=10–20;"
+        )
+        print(
+            "[Tips] increasing probes improves recall but slows queries; probes≈lists approaches exact search."
+        )
 
     conn = ensure_connection()
     # Ensure required extensions; handle failures with rollback to avoid aborted transaction
