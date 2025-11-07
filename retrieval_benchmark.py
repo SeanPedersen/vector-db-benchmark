@@ -218,7 +218,7 @@ def query_index(
     query_vec: np.ndarray,
     baseline_ids,
     debug=False,
-    local_embeddings=None,  # kept for backward compat; unused
+    local_embeddings=None,  # unused
 ):
     cursor = conn.cursor()
     # Prepare query textual forms
@@ -243,9 +243,17 @@ def query_index(
         rows = cursor.fetchall()
         retrieved = [r[0] for r in rows]
         latency = time.time() - start
-    elif kind in ("binary_hnsw", "binary_ivf", "binary_hnsw_numpy", "binary_ivf_numpy"):
-        # Binary overfetch with Hamming via index, then NumPy rerank on original embeddings
-        overfetch = K * OVERFETCH_FACTOR
+    elif kind in (
+        "binary_hnsw",
+        "binary_ivf",
+        "binary_hnsw_numpy",
+        "binary_ivf_numpy",
+        # NEW no-overfetch kinds
+        "binary_hnsw_k",
+        "binary_ivf_k",
+    ):
+        # Binary overfetch via index, then NumPy cosine rerank on stored embeddings
+        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR  # NEW
 
         # Configure index search params
         if "ivf" in kind:
@@ -253,38 +261,40 @@ def query_index(
         else:
             cursor.execute(f"SET hnsw.ef_search = {HNSW_EF_SEARCH}")
 
-        # Fetch candidates and their stored embeddings in one query
-        candidate_sql = f"""
-        SELECT id, embedding
+        # Candidate ids only
+        cand_sql = f"""
+        SELECT id
         FROM {table}
         ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
         LIMIT {overfetch}
         """
-
         # Warm-up
-        cursor.execute(candidate_sql, (query_txt,))
+        cursor.execute(cand_sql, (query_txt,))
         cursor.fetchall()
 
-        # Timed fetch + NumPy rerank
+        # Timed: candidate ids + embeddings + NumPy rerank
         start = time.time()
-        cursor.execute(candidate_sql, (query_txt,))
-        rows = cursor.fetchall()  # [(id, embedding), ...]
-        ids = [int(r[0]) for r in rows]
+        cursor.execute(cand_sql, (query_txt,))
+        ids = [int(r[0]) for r in cursor.fetchall()]
 
         if ids:
-            # CHANGED: parse embeddings robustly from pgvector textual form
-            cands = np.stack([_to_np_vec(r[1], dtype=np.float32) for r in rows], axis=0)
+            cursor.execute(
+                f"SELECT id, embedding FROM {table} WHERE id = ANY(%s)", (ids,)
+            )
+            rows_emb = cursor.fetchall()
+            emb_map = {
+                int(rid): _to_np_vec(emb, dtype=np.float32) for rid, emb in rows_emb
+            }
+            cands = np.stack([emb_map[i] for i in ids], axis=0)
 
             q = query_vec[:dim].astype(np.float32, copy=False)
             if precision == "halfvec":
                 cands = cands.astype(np.float16).astype(np.float32)
                 q = q.astype(np.float16).astype(np.float32)
 
-            # Cosine distance: 1 - cosine_similarity
             vnorms = np.linalg.norm(cands, axis=1)
             qnorm = float(np.linalg.norm(q))
-            sims = (cands @ q) / (vnorms * qnorm + 1e-12)
-            dists = 1.0 - sims
+            dists = 1.0 - (cands @ q) / (vnorms * qnorm)
 
             n = min(K, dists.shape[0])
             top_idx = np.argpartition(dists, n - 1)[:n]
@@ -294,36 +304,39 @@ def query_index(
             retrieved = []
 
         latency = time.time() - start
-    elif kind == "binary_exact":
-        # Exact binary overfetch without using any binary index; then NumPy rerank
-        overfetch = K * OVERFETCH_FACTOR
+    elif kind in ("binary_exact", "binary_exact_k"):  # NEW: _k variant
+        # Exact binary overfetch (seq scan); NumPy cosine rerank
+        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR  # NEW
         try:
             cursor.execute("SET enable_indexscan = off")
             cursor.execute("SET enable_bitmapscan = off")
             cursor.execute("SET enable_indexonlyscan = off")
             cursor.execute("SET enable_seqscan = on")
 
-            candidate_sql = f"""
-            SELECT id, embedding
+            cand_sql = f"""
+            SELECT id
             FROM {table}
             ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
             LIMIT {overfetch}
             """
             # Warm-up
-            cursor.execute(candidate_sql, (query_txt,))
+            cursor.execute(cand_sql, (query_txt,))
             cursor.fetchall()
 
-            # Timed fetch + NumPy rerank
+            # Timed: candidate ids + embeddings + NumPy rerank
             start = time.time()
-            cursor.execute(candidate_sql, (query_txt,))
-            rows = cursor.fetchall()
-            ids = [int(r[0]) for r in rows]
+            cursor.execute(cand_sql, (query_txt,))
+            ids = [int(r[0]) for r in cursor.fetchall()]
 
             if ids:
-                # CHANGED: parse embeddings robustly from pgvector textual form
-                cands = np.stack(
-                    [_to_np_vec(r[1], dtype=np.float32) for r in rows], axis=0
+                cursor.execute(
+                    f"SELECT id, embedding FROM {table} WHERE id = ANY(%s)", (ids,)
                 )
+                rows_emb = cursor.fetchall()
+                emb_map = {
+                    int(rid): _to_np_vec(emb, dtype=np.float32) for rid, emb in rows_emb
+                }
+                cands = np.stack([emb_map[i] for i in ids], axis=0)
 
                 q = query_vec[:dim].astype(np.float32, copy=False)
                 if precision == "halfvec":
@@ -332,8 +345,7 @@ def query_index(
 
                 vnorms = np.linalg.norm(cands, axis=1)
                 qnorm = float(np.linalg.norm(q))
-                sims = (cands @ q) / (vnorms * qnorm + 1e-12)
-                dists = 1.0 - sims
+                dists = 1.0 - (cands @ q) / (vnorms * qnorm)
 
                 n = min(K, dists.shape[0])
                 top_idx = np.argpartition(dists, n - 1)[:n]
@@ -774,14 +786,40 @@ def main():
             conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids
         )
 
-        # New: exact retrieval (sequential, no index)
-        print("[Query] Exact float32 (sequential, no index)...")
-        lat_exact_vec, rec_exact_vec = query_index(
-            conn, tbl_vector, "vector", "exact", dim, query_trunc, baseline_ids
+        # NEW: binary no-overfetch (K only) + NumPy rerank
+        print(
+            f"[Query] HNSW binary NumPy rerank float32 (ef={HNSW_EF_SEARCH}, 1x overfetch)..."
         )
-        print("[Query] Exact float16 (sequential, no index)...")
-        lat_exact_half, rec_exact_half = query_index(
-            conn, tbl_half, "halfvec", "exact", dim, query_trunc, baseline_ids
+        lat_hnsw_bin_k, rec_hnsw_bin_k = query_index(
+            conn, tbl_vector, "vector", "binary_hnsw_k", dim, query_trunc, baseline_ids
+        )
+        print(
+            f"[Query] HNSW binary NumPy rerank float16 (ef={HNSW_EF_SEARCH}, 1x overfetch)..."
+        )
+        lat_hnsw_bin_k_half, rec_hnsw_bin_k_half = query_index(
+            conn, tbl_half, "halfvec", "binary_hnsw_k", dim, query_trunc, baseline_ids
+        )
+
+        print(
+            f"[Query] IVFFlat binary NumPy rerank float32 (probes={IVF_PROBES_BINARY}, 1x overfetch)..."
+        )
+        lat_ivf_bin_k, rec_ivf_bin_k = query_index(
+            conn, tbl_vector, "vector", "binary_ivf_k", dim, query_trunc, baseline_ids
+        )
+        print(
+            f"[Query] IVFFlat binary NumPy rerank float16 (probes={IVF_PROBES_BINARY}, 1x overfetch)..."
+        )
+        lat_ivf_bin_k_half, rec_ivf_bin_k_half = query_index(
+            conn, tbl_half, "halfvec", "binary_ivf_k", dim, query_trunc, baseline_ids
+        )
+
+        print(f"[Query] Exact binary float32 rerank (1x overfetch)...")
+        lat_bin_exact_k_vec, rec_bin_exact_k_vec = query_index(
+            conn, tbl_vector, "vector", "binary_exact_k", dim, query_trunc, baseline_ids
+        )
+        print(f"[Query] Exact binary float16 rerank (1x overfetch)...")
+        lat_bin_exact_k_half, rec_bin_exact_k_half = query_index(
+            conn, tbl_half, "halfvec", "binary_exact_k", dim, query_trunc, baseline_ids
         )
 
         # Calculate storage sizes
@@ -948,6 +986,67 @@ def main():
                     "recall": rec_ivf_bin_np_half,
                     "build_s": t_ivf_bin_half,
                     "index_mb": size_ivf_bin_half,
+                    "storage_mb": storage_half_mb,
+                },
+                # NEW: binary no-overfetch (K only) + NumPy rerank
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"hnsw+binary+numpy(ef{HNSW_EF_SEARCH},1x)",
+                    "lat_ms": lat_hnsw_bin_k * 1000,
+                    "recall": rec_hnsw_bin_k,
+                    "build_s": t_hnsw_bin,
+                    "index_mb": size_hnsw_bin,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"hnsw+binary+numpy(ef{HNSW_EF_SEARCH},1x)",
+                    "lat_ms": lat_hnsw_bin_k_half * 1000,
+                    "recall": rec_hnsw_bin_k_half,
+                    "build_s": t_hnsw_bin_half,
+                    "index_mb": size_hnsw_bin_half,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"ivf+binary+numpy(L{IVF_LISTS},P{IVF_PROBES_BINARY},1x)",
+                    "lat_ms": lat_ivf_bin_k * 1000,
+                    "recall": rec_ivf_bin_k,
+                    "build_s": t_ivf_bin,
+                    "index_mb": size_ivf_bin,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"ivf+binary+numpy(L{IVF_LISTS},P{IVF_PROBES_BINARY},1x)",
+                    "lat_ms": lat_ivf_bin_k_half * 1000,
+                    "recall": rec_ivf_bin_k_half,
+                    "build_s": t_ivf_bin_half,
+                    "index_mb": size_ivf_bin_half,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": "exact-binary(1x)",
+                    "lat_ms": lat_bin_exact_k_vec * 1000,
+                    "recall": rec_bin_exact_k_vec,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": "exact-binary(1x)",
+                    "lat_ms": lat_bin_exact_k_half * 1000,
+                    "recall": rec_bin_exact_k_half,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
                     "storage_mb": storage_half_mb,
                 },
             ]
