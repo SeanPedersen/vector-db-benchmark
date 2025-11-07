@@ -90,6 +90,37 @@ def generate_embeddings(num_vectors: int, full_dim: int = 1024):
     return data
 
 
+def compute_dimension_means(embeddings: np.ndarray):
+    """Compute mean for each dimension across all vectors."""
+    return np.mean(embeddings, axis=0)
+
+
+def binarize_with_means(embeddings: np.ndarray, means: np.ndarray):
+    """Binarize vectors using mean-based thresholding.
+
+    For each dimension, use its corpus-wide mean as threshold:
+    - value >= mean -> 1
+    - value < mean -> 0
+
+    This ensures ~50/50 bit distribution per dimension for better
+    information preservation and more discriminative binary codes.
+    """
+    return (embeddings >= means).astype(np.uint8)
+
+
+def numpy_binary_to_postgres_bit_string(binary_array: np.ndarray):
+    """Convert numpy binary array to PostgreSQL bit string format.
+
+    Args:
+        binary_array: 1D numpy array of 0s and 1s
+
+    Returns:
+        String in format 'B10101...' for PostgreSQL bit type
+    """
+    bit_string = ''.join(binary_array.astype(str))
+    return f"B'{bit_string}'"
+
+
 def build_baseline(full_embeddings: np.ndarray, query: np.ndarray):
     sims = full_embeddings @ query
     top_idx = np.argsort(sims)[::-1][:K]
@@ -100,7 +131,7 @@ def ensure_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 
-def table_exists_and_populated(conn, table_name: str, expected_rows: int):
+def table_exists_and_populated(conn, table_name: str, expected_rows: int, check_mean_bin=False):
     """Check if table exists and has the expected number of rows."""
     cursor = conn.cursor()
     try:
@@ -126,6 +157,21 @@ def table_exists_and_populated(conn, table_name: str, expected_rows: int):
             cursor.close()
             return False
 
+        # Check for mean-based binary column if required
+        if check_mean_bin:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.columns
+                WHERE table_name = %s AND column_name = 'embedding_bin_mean'
+                """,
+                (table_name,),
+            )
+            has_mean_bin = cursor.fetchone()[0] > 0
+            if not has_mean_bin:
+                cursor.close()
+                return False
+
         cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
         actual_rows = cursor.fetchone()[0]
         cursor.close()
@@ -136,7 +182,7 @@ def table_exists_and_populated(conn, table_name: str, expected_rows: int):
         return False
 
 
-def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: str):
+def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: str, use_mean_binarization=False, dimension_means=None):
     cursor = conn.cursor()
     cursor.execute(f"DROP TABLE IF EXISTS {name}")
     dim = embeddings.shape[1]
@@ -148,6 +194,7 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
                 id BIGINT PRIMARY KEY,
                 embedding vector({dim}),
                 embedding_bin bit({dim}) GENERATED ALWAYS AS (binary_quantize(embedding)::bit({dim})) STORED
+                {", embedding_bin_mean bit(" + str(dim) + ")" if use_mean_binarization else ""}
             )
             """
         )
@@ -160,6 +207,7 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
                 id BIGINT PRIMARY KEY,
                 embedding halfvec({dim}),
                 embedding_bin bit({dim}) GENERATED ALWAYS AS (binary_quantize(embedding)::bit({dim})) STORED
+                {", embedding_bin_mean bit(" + str(dim) + ")" if use_mean_binarization else ""}
             )
             """
         )
@@ -170,54 +218,80 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
 
     ids = np.arange(embeddings.shape[0], dtype=np.int64)
 
+    # If mean binarization is enabled, compute binary vectors
+    if use_mean_binarization and dimension_means is not None:
+        binary_vecs = binarize_with_means(embeddings[:, :dim], dimension_means[:dim])
+
     for i in tqdm(
         range(0, embeddings.shape[0], BATCH_SIZE), desc=f"Insert {name}", unit="batch"
     ):
         batch_end = min(i + BATCH_SIZE, embeddings.shape[0])
-        batch_data = [
-            (
-                int(ids[j]),
-                embeddings[j][:dim]
-                .astype(np.float16 if precision == "halfvec" else np.float32)
-                .tolist(),
+        if use_mean_binarization and dimension_means is not None:
+            batch_data = [
+                (
+                    int(ids[j]),
+                    embeddings[j][:dim]
+                    .astype(np.float16 if precision == "halfvec" else np.float32)
+                    .tolist(),
+                    numpy_binary_to_postgres_bit_string(binary_vecs[j]),
+                )
+                for j in range(i, batch_end)
+            ]
+            execute_values(
+                cursor,
+                f"INSERT INTO {name} (id, embedding, embedding_bin_mean) VALUES %s",
+                batch_data,
+                template=f"(%s, %s{cast}, %s)",
             )
-            for j in range(i, batch_end)
-        ]
-        execute_values(
-            cursor,
-            f"INSERT INTO {name} (id, embedding) VALUES %s",
-            batch_data,
-            template=f"(%s, %s{cast})",
-        )
+        else:
+            batch_data = [
+                (
+                    int(ids[j]),
+                    embeddings[j][:dim]
+                    .astype(np.float16 if precision == "halfvec" else np.float32)
+                    .tolist(),
+                )
+                for j in range(i, batch_end)
+            ]
+            execute_values(
+                cursor,
+                f"INSERT INTO {name} (id, embedding) VALUES %s",
+                batch_data,
+                template=f"(%s, %s{cast})",
+            )
         if (i // BATCH_SIZE) % 10 == 0:
             conn.commit()
     conn.commit()
     cursor.close()
 
 
-def build_index(conn, table: str, precision: str, kind: str, dim: int):
+def build_index(conn, table: str, precision: str, kind: str, dim: int, use_mean_bin=False):
     cursor = conn.cursor()
     if kind == "binary_hnsw":
-        idx_name = f"idx_{table}_hnsw_bin"
+        bin_col = "embedding_bin_mean" if use_mean_bin else "embedding_bin"
+        suffix = "_mean" if use_mean_bin else ""
+        idx_name = f"idx_{table}_hnsw_bin{suffix}"
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
         try:
             # NEW: index the stored binary column with HNSW build params
             cursor.execute(
-                f"CREATE INDEX {idx_name} ON {table} USING hnsw (embedding_bin bit_hamming_ops) "
+                f"CREATE INDEX {idx_name} ON {table} USING hnsw ({bin_col} bit_hamming_ops) "
                 f"WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION})"
             )
         except Exception:
             conn.rollback()
             idx_name = None
     elif kind == "binary_ivf":
-        idx_name = f"idx_{table}_ivf_bin"
+        bin_col = "embedding_bin_mean" if use_mean_bin else "embedding_bin"
+        suffix = "_mean" if use_mean_bin else ""
+        idx_name = f"idx_{table}_ivf_bin{suffix}"
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
         try:
             # NEW: index the stored binary column directly
             cursor.execute(
-                f"CREATE INDEX {idx_name} ON {table} USING ivfflat (embedding_bin bit_hamming_ops) WITH (lists = {IVF_LISTS})"
+                f"CREATE INDEX {idx_name} ON {table} USING ivfflat ({bin_col} bit_hamming_ops) WITH (lists = {IVF_LISTS})"
             )
         except Exception:
             conn.rollback()
@@ -276,11 +350,20 @@ def query_index(
     debug=False,
     local_embeddings=None,  # unused
     explain_analyze=False,
+    use_mean_bin=False,
+    dimension_means=None,
 ):
     cursor = conn.cursor()
     # Prepare query textual forms
     query_list_full = query_vec[:dim].tolist()
     query_txt = "[" + ",".join(map(str, query_list_full)) + "]"
+
+    # Prepare query binary representation for mean-based binarization
+    if use_mean_bin and dimension_means is not None:
+        query_bin_mean = binarize_with_means(
+            query_vec[:dim].reshape(1, -1), dimension_means[:dim]
+        )[0]
+        query_bin_mean_str = numpy_binary_to_postgres_bit_string(query_bin_mean)
 
     if kind == "ivf":
         # Set probes for IVFFlat
@@ -314,53 +397,44 @@ def query_index(
             cursor.execute(f"SET hnsw.ef_search = {eff}")
 
         cast_type = "vector" if precision == "vector" else "halfvec"
-        # One-shot candidate + rerank fully in SQL
-        sql = f"""
-        SELECT t.id
-        FROM (
-          SELECT id
-          FROM {table}
-          ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
-          LIMIT {overfetch}
-        ) c
-        JOIN {table} t USING(id)
-        ORDER BY t.embedding <=> %s::{cast_type}
-        LIMIT {K}
-        """
-        # Warm-up
-        cursor.execute(sql, (query_txt, query_txt))
-        cursor.fetchall()
 
-        # Optional EXPLAIN ANALYZE for debugging
-        if explain_analyze:
-            print(f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}):")
-            explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) " + sql
-            cursor.execute(explain_sql, (query_txt, query_txt))
-            for row in cursor.fetchall():
-                print(row[0])
-            print()
-
-        start = time.time()
-        cursor.execute(sql, (query_txt, query_txt))
-        rows = cursor.fetchall()
-        retrieved = [int(r[0]) for r in rows]
-        latency = time.time() - start
-    elif kind in ("binary_exact", "binary_exact_k"):
-        # Exact binary candidate generation (no index). For _k: no rerank to measure pure Hamming scan speed.
-        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR
-        cast_type = "vector" if precision == "vector" else "halfvec"
-
-        if kind.endswith("_k"):
-            # Pure binary Hamming top-K without float rerank
+        # Choose binary column and query based on mean binarization flag
+        if use_mean_bin:
+            bin_col = "embedding_bin_mean"
+            query_bin_str = query_bin_mean_str
+            # One-shot candidate + rerank fully in SQL (using numpy-computed binary query)
             sql = f"""
-            SELECT id
-            FROM {table}
-            ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
+            SELECT t.id
+            FROM (
+              SELECT id
+              FROM {table}
+              ORDER BY {bin_col} <~> %s::bit({dim})
+              LIMIT {overfetch}
+            ) c
+            JOIN {table} t USING(id)
+            ORDER BY t.embedding <=> %s::{cast_type}
             LIMIT {K}
             """
-            params = (query_txt,)
+            # Warm-up
+            cursor.execute(sql, (query_bin_str, query_txt))
+            cursor.fetchall()
+
+            # Optional EXPLAIN ANALYZE for debugging
+            if explain_analyze:
+                print(f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}, mean-bin):")
+                explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) " + sql
+                cursor.execute(explain_sql, (query_bin_str, query_txt))
+                for row in cursor.fetchall():
+                    print(row[0])
+                print()
+
+            start = time.time()
+            cursor.execute(sql, (query_bin_str, query_txt))
+            rows = cursor.fetchall()
+            retrieved = [int(r[0]) for r in rows]
+            latency = time.time() - start
         else:
-            # Generate candidates by Hamming, then rerank by cosine in-db
+            # One-shot candidate + rerank fully in SQL (using pgvector binary_quantize)
             sql = f"""
             SELECT t.id
             FROM (
@@ -373,7 +447,81 @@ def query_index(
             ORDER BY t.embedding <=> %s::{cast_type}
             LIMIT {K}
             """
-            params = (query_txt, query_txt)
+            # Warm-up
+            cursor.execute(sql, (query_txt, query_txt))
+            cursor.fetchall()
+
+            # Optional EXPLAIN ANALYZE for debugging
+            if explain_analyze:
+                print(f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}):")
+                explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) " + sql
+                cursor.execute(explain_sql, (query_txt, query_txt))
+                for row in cursor.fetchall():
+                    print(row[0])
+                print()
+
+            start = time.time()
+            cursor.execute(sql, (query_txt, query_txt))
+            rows = cursor.fetchall()
+            retrieved = [int(r[0]) for r in rows]
+            latency = time.time() - start
+    elif kind in ("binary_exact", "binary_exact_k"):
+        # Exact binary candidate generation (no index). For _k: no rerank to measure pure Hamming scan speed.
+        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR
+        cast_type = "vector" if precision == "vector" else "halfvec"
+
+        if use_mean_bin:
+            bin_col = "embedding_bin_mean"
+            query_bin_str = query_bin_mean_str
+            if kind.endswith("_k"):
+                # Pure binary Hamming top-K without float rerank (mean-based)
+                sql = f"""
+                SELECT id
+                FROM {table}
+                ORDER BY {bin_col} <~> %s::bit({dim})
+                LIMIT {K}
+                """
+                params = (query_bin_str,)
+            else:
+                # Generate candidates by Hamming, then rerank by cosine in-db (mean-based)
+                sql = f"""
+                SELECT t.id
+                FROM (
+                  SELECT id
+                  FROM {table}
+                  ORDER BY {bin_col} <~> %s::bit({dim})
+                  LIMIT {overfetch}
+                ) c
+                JOIN {table} t USING(id)
+                ORDER BY t.embedding <=> %s::{cast_type}
+                LIMIT {K}
+                """
+                params = (query_bin_str, query_txt)
+        else:
+            if kind.endswith("_k"):
+                # Pure binary Hamming top-K without float rerank
+                sql = f"""
+                SELECT id
+                FROM {table}
+                ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
+                LIMIT {K}
+                """
+                params = (query_txt,)
+            else:
+                # Generate candidates by Hamming, then rerank by cosine in-db
+                sql = f"""
+                SELECT t.id
+                FROM (
+                  SELECT id
+                  FROM {table}
+                  ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
+                  LIMIT {overfetch}
+                ) c
+                JOIN {table} t USING(id)
+                ORDER BY t.embedding <=> %s::{cast_type}
+                LIMIT {K}
+                """
+                params = (query_txt, query_txt)
 
         try:
             cursor.execute("SET enable_indexscan = off")
@@ -401,18 +549,38 @@ def query_index(
     elif kind == "binary_exact_np10":
         # Exact binary candidate generation with fixed 10x overfetch, SQL rerank in-db
         cast_type = "vector" if precision == "vector" else "halfvec"
-        sql = f"""
-        SELECT t.id
-        FROM (
-          SELECT id
-          FROM {table}
-          ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
-          LIMIT {K * 10}
-        ) c
-        JOIN {table} t USING(id)
-        ORDER BY t.embedding <=> %s::{cast_type}
-        LIMIT {K}
-        """
+
+        if use_mean_bin:
+            bin_col = "embedding_bin_mean"
+            query_bin_str = query_bin_mean_str
+            sql = f"""
+            SELECT t.id
+            FROM (
+              SELECT id
+              FROM {table}
+              ORDER BY {bin_col} <~> %s::bit({dim})
+              LIMIT {K * 10}
+            ) c
+            JOIN {table} t USING(id)
+            ORDER BY t.embedding <=> %s::{cast_type}
+            LIMIT {K}
+            """
+            params = (query_bin_str, query_txt)
+        else:
+            sql = f"""
+            SELECT t.id
+            FROM (
+              SELECT id
+              FROM {table}
+              ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
+              LIMIT {K * 10}
+            ) c
+            JOIN {table} t USING(id)
+            ORDER BY t.embedding <=> %s::{cast_type}
+            LIMIT {K}
+            """
+            params = (query_txt, query_txt)
+
         try:
             cursor.execute("SET enable_indexscan = off")
             cursor.execute("SET enable_bitmapscan = off")
@@ -420,11 +588,11 @@ def query_index(
             cursor.execute("SET enable_seqscan = on")
 
             # Warm-up
-            cursor.execute(sql, (query_txt, query_txt))
+            cursor.execute(sql, params)
             cursor.fetchall()
 
             start = time.time()
-            cursor.execute(sql, (query_txt, query_txt))
+            cursor.execute(sql, params)
             rows = cursor.fetchall()
             retrieved = [int(r[0]) for r in rows]
             latency = time.time() - start
@@ -603,7 +771,57 @@ def main():
         action="store_true",
         help="Print EXPLAIN ANALYZE output for query debugging (shows only for 512-D queries)",
     )
+
+    # NEW: Benchmark selection via positive selection
+    parser.add_argument(
+        "--benchmark", "-b",
+        action="append",
+        choices=[
+            "vchordrq", "vchord",
+            "ivfflat", "ivf",
+            "binary-hnsw", "hnsw-bin",
+            "binary-ivf", "ivf-bin",
+            "binary-exact", "exact-bin",
+            "exact",
+            "all"
+        ],
+        help=(
+            "Benchmarks to run (can be specified multiple times). "
+            "Available: vchordrq/vchord, ivfflat/ivf, binary-hnsw/hnsw-bin, "
+            "binary-ivf/ivf-bin, binary-exact/exact-bin, exact, all. "
+            "Default: all benchmarks if not specified."
+        ),
+    )
+    parser.add_argument(
+        "--enable-mean-binarization",
+        action="store_true",
+        help="Enable mean-based binarization (uses corpus-wide mean per dimension as threshold)",
+    )
+
     args = parser.parse_args()
+
+    # Process benchmark selection
+    if args.benchmark is None or "all" in args.benchmark:
+        # Default: run all benchmarks
+        benchmarks = {"vchordrq", "ivfflat", "binary-hnsw", "binary-ivf", "binary-exact", "exact"}
+    else:
+        # Normalize benchmark names (handle aliases)
+        benchmarks = set()
+        for b in args.benchmark:
+            if b in ("vchordrq", "vchord"):
+                benchmarks.add("vchordrq")
+            elif b in ("ivfflat", "ivf"):
+                benchmarks.add("ivfflat")
+            elif b in ("binary-hnsw", "hnsw-bin"):
+                benchmarks.add("binary-hnsw")
+            elif b in ("binary-ivf", "ivf-bin"):
+                benchmarks.add("binary-ivf")
+            elif b in ("binary-exact", "exact-bin"):
+                benchmarks.add("binary-exact")
+            elif b == "exact":
+                benchmarks.add("exact")
+
+    print(f"[Setup] Running benchmarks: {', '.join(sorted(benchmarks))}")
 
     # Handle backward compatibility for --num-vectors
     if args.num_vectors is not None:
@@ -692,6 +910,14 @@ def main():
         print(f"[Setup] Generating {num_vectors:,} normalized 1024-d embeddings...")
         full_embeddings = generate_embeddings(num_vectors)
 
+    # Compute dimension means for mean-based binarization if enabled
+    dimension_means_1024 = None
+    if args.enable_mean_binarization:
+        print("[Setup] Computing dimension-wise means for mean-based binarization...")
+        dimension_means_1024 = compute_dimension_means(full_embeddings)
+        print(f"[Setup] Computed means for all 1024 dimensions")
+        print(f"[Setup] Mean range: [{dimension_means_1024.min():.6f}, {dimension_means_1024.max():.6f}]")
+
     # Use a random vector from the dataset as the query (more realistic)
     print("[Setup] Selecting random query vector from dataset...")
     np.random.seed(999)
@@ -773,12 +999,14 @@ def main():
         tbl_half = f"items_half_{dim}"
 
         # Check if tables already exist and are populated
-        vec_exists = table_exists_and_populated(conn, tbl_vector, num_vectors)
-        half_exists = table_exists_and_populated(conn, tbl_half, num_vectors)
+        vec_exists = table_exists_and_populated(conn, tbl_vector, num_vectors, check_mean_bin=args.enable_mean_binarization)
+        half_exists = table_exists_and_populated(conn, tbl_half, num_vectors, check_mean_bin=args.enable_mean_binarization)
 
         if args.force_reload or not vec_exists:
             print(f"[Storage] Creating + inserting float32 table {tbl_vector} ...")
-            create_and_insert_table(conn, tbl_vector, trunc_embeddings, "vector")
+            create_and_insert_table(conn, tbl_vector, trunc_embeddings, "vector",
+                                   use_mean_binarization=args.enable_mean_binarization,
+                                   dimension_means=dimension_means_1024)
         else:
             print(
                 f"[Storage] Skipping {tbl_vector} (already populated with {num_vectors:,} rows)"
@@ -786,369 +1014,594 @@ def main():
 
         if args.force_reload or not half_exists:
             print(f"[Storage] Creating + inserting float16 table {tbl_half} ...")
-            create_and_insert_table(conn, tbl_half, trunc_embeddings, "halfvec")
+            create_and_insert_table(conn, tbl_half, trunc_embeddings, "halfvec",
+                                   use_mean_binarization=args.enable_mean_binarization,
+                                   dimension_means=dimension_means_1024)
         else:
             print(
                 f"[Storage] Skipping {tbl_half} (already populated with {num_vectors:,} rows)"
             )
 
-        # Build indices
-        print("[Index] Building VectorChord (vector)...")
-        idx_vchord_vec, t_vchord_vec = build_index(
-            conn, tbl_vector, "vector", "full", dim
-        )
-        print("[Index] Building VectorChord (halfvec)...")
-        idx_vchord_half, t_vchord_half = build_index(
-            conn, tbl_half, "halfvec", "half", dim
-        )
-        print(f"[Index] Building IVFFlat (vector, lists={IVF_LISTS})...")
-        idx_ivf_vec, t_ivf_vec = build_index(conn, tbl_vector, "vector", "ivf", dim)
-        print(f"[Index] Building IVFFlat (halfvec, lists={IVF_LISTS})...")
-        idx_ivf_half, t_ivf_half = build_index(conn, tbl_half, "halfvec", "ivf", dim)
-        print("[Index] Building HNSW binary (bit, float32 rerank) ...")
-        idx_hnsw_bin, t_hnsw_bin = build_index(
-            conn, tbl_vector, "vector", "binary_hnsw", dim
-        )
-        print("[Index] Building HNSW binary (bit, float16 rerank) ...")
-        idx_hnsw_bin_half, t_hnsw_bin_half = build_index(
-            conn, tbl_half, "halfvec", "binary_hnsw", dim
-        )
-        print(
-            f"[Index] Building IVFFlat binary (bit, float32 rerank, lists={IVF_LISTS}) ..."
-        )
-        idx_ivf_bin, t_ivf_bin = build_index(
-            conn, tbl_vector, "vector", "binary_ivf", dim
-        )
-        print(
-            f"[Index] Building IVFFlat binary (bit, float16 rerank, lists={IVF_LISTS}) ..."
-        )
-        idx_ivf_bin_half, t_ivf_bin_half = build_index(
-            conn, tbl_half, "halfvec", "binary_ivf", dim
-        )
+        # Build indices (conditionally based on selected benchmarks)
+        # VectorChord indices
+        if "vchordrq" in benchmarks:
+            print("[Index] Building VectorChord (vector)...")
+            idx_vchord_vec, t_vchord_vec = build_index(
+                conn, tbl_vector, "vector", "full", dim
+            )
+            print("[Index] Building VectorChord (halfvec)...")
+            idx_vchord_half, t_vchord_half = build_index(
+                conn, tbl_half, "halfvec", "half", dim
+            )
+        else:
+            idx_vchord_vec, t_vchord_vec = None, 0.0
+            idx_vchord_half, t_vchord_half = None, 0.0
 
-        # Query each
-        print("[Query] VectorChord full precision...")
-        lat_vchord_vec, rec_vchord_vec = query_index(
-            conn, tbl_vector, "vector", "full", dim, query_trunc, baseline_ids
-        )
-        size_vchord_vec = get_index_size_mb(conn, idx_vchord_vec)
+        # IVFFlat indices
+        if "ivfflat" in benchmarks:
+            print(f"[Index] Building IVFFlat (vector, lists={IVF_LISTS})...")
+            idx_ivf_vec, t_ivf_vec = build_index(conn, tbl_vector, "vector", "ivf", dim)
+            print(f"[Index] Building IVFFlat (halfvec, lists={IVF_LISTS})...")
+            idx_ivf_half, t_ivf_half = build_index(conn, tbl_half, "halfvec", "ivf", dim)
+        else:
+            idx_ivf_vec, t_ivf_vec = None, 0.0
+            idx_ivf_half, t_ivf_half = None, 0.0
 
-        print("[Query] VectorChord half precision...")
-        lat_vchord_half, rec_vchord_half = query_index(
-            conn, tbl_half, "halfvec", "half", dim, query_trunc, baseline_ids
-        )
-        size_vchord_half = get_index_size_mb(conn, idx_vchord_half)
+        # Binary HNSW indices
+        if "binary-hnsw" in benchmarks:
+            print("[Index] Building HNSW binary (bit, float32 rerank) ...")
+            idx_hnsw_bin, t_hnsw_bin = build_index(
+                conn, tbl_vector, "vector", "binary_hnsw", dim
+            )
+            print("[Index] Building HNSW binary (bit, float16 rerank) ...")
+            idx_hnsw_bin_half, t_hnsw_bin_half = build_index(
+                conn, tbl_half, "halfvec", "binary_hnsw", dim
+            )
+            if args.enable_mean_binarization:
+                print("[Index] Building HNSW binary MEAN (bit, float32 rerank) ...")
+                idx_hnsw_bin_mean, t_hnsw_bin_mean = build_index(
+                    conn, tbl_vector, "vector", "binary_hnsw", dim, use_mean_bin=True
+                )
+                print("[Index] Building HNSW binary MEAN (bit, float16 rerank) ...")
+                idx_hnsw_bin_half_mean, t_hnsw_bin_half_mean = build_index(
+                    conn, tbl_half, "halfvec", "binary_hnsw", dim, use_mean_bin=True
+                )
+            else:
+                idx_hnsw_bin_mean, t_hnsw_bin_mean = None, 0.0
+                idx_hnsw_bin_half_mean, t_hnsw_bin_half_mean = None, 0.0
+        else:
+            idx_hnsw_bin, t_hnsw_bin = None, 0.0
+            idx_hnsw_bin_half, t_hnsw_bin_half = None, 0.0
+            idx_hnsw_bin_mean, t_hnsw_bin_mean = None, 0.0
+            idx_hnsw_bin_half_mean, t_hnsw_bin_half_mean = None, 0.0
 
-        print(f"[Query] IVFFlat full precision (probes={IVF_PROBES})...")
-        lat_ivf_vec, rec_ivf_vec = query_index(
-            conn, tbl_vector, "vector", "ivf", dim, query_trunc, baseline_ids
-        )
-        size_ivf_vec = get_index_size_mb(conn, idx_ivf_vec)
+        # Binary IVFFlat indices
+        if "binary-ivf" in benchmarks:
+            print(
+                f"[Index] Building IVFFlat binary (bit, float32 rerank, lists={IVF_LISTS}) ..."
+            )
+            idx_ivf_bin, t_ivf_bin = build_index(
+                conn, tbl_vector, "vector", "binary_ivf", dim
+            )
+            print(
+                f"[Index] Building IVFFlat binary (bit, float16 rerank, lists={IVF_LISTS}) ..."
+            )
+            idx_ivf_bin_half, t_ivf_bin_half = build_index(
+                conn, tbl_half, "halfvec", "binary_ivf", dim
+            )
+            if args.enable_mean_binarization:
+                print(
+                    f"[Index] Building IVFFlat binary MEAN (bit, float32 rerank, lists={IVF_LISTS}) ..."
+                )
+                idx_ivf_bin_mean, t_ivf_bin_mean = build_index(
+                    conn, tbl_vector, "vector", "binary_ivf", dim, use_mean_bin=True
+                )
+                print(
+                    f"[Index] Building IVFFlat binary MEAN (bit, float16 rerank, lists={IVF_LISTS}) ..."
+                )
+                idx_ivf_bin_half_mean, t_ivf_bin_half_mean = build_index(
+                    conn, tbl_half, "halfvec", "binary_ivf", dim, use_mean_bin=True
+                )
+            else:
+                idx_ivf_bin_mean, t_ivf_bin_mean = None, 0.0
+                idx_ivf_bin_half_mean, t_ivf_bin_half_mean = None, 0.0
+        else:
+            idx_ivf_bin, t_ivf_bin = None, 0.0
+            idx_ivf_bin_half, t_ivf_bin_half = None, 0.0
+            idx_ivf_bin_mean, t_ivf_bin_mean = None, 0.0
+            idx_ivf_bin_half_mean, t_ivf_bin_half_mean = None, 0.0
 
-        print(f"[Query] IVFFlat half precision (probes={IVF_PROBES})...")
-        lat_ivf_half, rec_ivf_half = query_index(
-            conn, tbl_half, "halfvec", "ivf", dim, query_trunc, baseline_ids
-        )
-        size_ivf_half = get_index_size_mb(conn, idx_ivf_half)
-
+        # Query each (conditionally based on selected benchmarks)
         # Enable explain_analyze only for 512-D queries
         do_explain = args.explain_analyze and dim == 512
 
-        print(
-            f"[Query] HNSW binary float32 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
-        )
-        lat_hnsw_bin, rec_hnsw_bin = query_index(
-            conn,
-            tbl_vector,
-            "vector",
-            "binary_hnsw",
-            dim,
-            query_trunc,
-            baseline_ids,
-            explain_analyze=do_explain,
-        )
-        size_hnsw_bin = get_index_size_mb(conn, idx_hnsw_bin)
+        # VectorChord queries
+        if "vchordrq" in benchmarks:
+            print("[Query] VectorChord full precision...")
+            lat_vchord_vec, rec_vchord_vec = query_index(
+                conn, tbl_vector, "vector", "full", dim, query_trunc, baseline_ids
+            )
+            size_vchord_vec = get_index_size_mb(conn, idx_vchord_vec)
 
-        print(
-            f"[Query] HNSW binary float16 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
-        )
-        lat_hnsw_bin_half, rec_hnsw_bin_half = query_index(
-            conn,
-            tbl_half,
-            "halfvec",
-            "binary_hnsw",
-            dim,
-            query_trunc,
-            baseline_ids,
-            explain_analyze=do_explain,
-        )
-        size_hnsw_bin_half = get_index_size_mb(conn, idx_hnsw_bin_half)
+            print("[Query] VectorChord half precision...")
+            lat_vchord_half, rec_vchord_half = query_index(
+                conn, tbl_half, "halfvec", "half", dim, query_trunc, baseline_ids
+            )
+            size_vchord_half = get_index_size_mb(conn, idx_vchord_half)
 
-        print(
-            f"[Query] IVFFlat binary float32 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
-        )
-        lat_ivf_bin, rec_ivf_bin = query_index(
-            conn,
-            tbl_vector,
-            "vector",
-            "binary_ivf",
-            dim,
-            query_trunc,
-            baseline_ids,
-            explain_analyze=do_explain,
-        )
-        size_ivf_bin = get_index_size_mb(conn, idx_ivf_bin)
+        # IVFFlat queries
+        if "ivfflat" in benchmarks:
+            print(f"[Query] IVFFlat full precision (probes={IVF_PROBES})...")
+            lat_ivf_vec, rec_ivf_vec = query_index(
+                conn, tbl_vector, "vector", "ivf", dim, query_trunc, baseline_ids
+            )
+            size_ivf_vec = get_index_size_mb(conn, idx_ivf_vec)
 
-        print(
-            f"[Query] IVFFlat binary float16 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
-        )
-        lat_ivf_bin_half, rec_ivf_bin_half = query_index(
-            conn,
-            tbl_half,
-            "halfvec",
-            "binary_ivf",
-            dim,
-            query_trunc,
-            baseline_ids,
-            explain_analyze=do_explain,
-        )
-        size_ivf_bin_half = get_index_size_mb(conn, idx_ivf_bin_half)
+            print(f"[Query] IVFFlat half precision (probes={IVF_PROBES})...")
+            lat_ivf_half, rec_ivf_half = query_index(
+                conn, tbl_half, "halfvec", "ivf", dim, query_trunc, baseline_ids
+            )
+            size_ivf_half = get_index_size_mb(conn, idx_ivf_half)
 
-        # Exact binary (no binary index) + rerank
-        print(f"[Query] Exact binary float32 rerank ({OVERFETCH_FACTOR}x overfetch)...")
-        lat_bin_exact_vec, rec_bin_exact_vec = query_index(
-            conn, tbl_vector, "vector", "binary_exact", dim, query_trunc, baseline_ids
-        )
-        print(f"[Query] Exact binary float16 rerank ({OVERFETCH_FACTOR}x overfetch)...")
-        lat_bin_exact_half, rec_bin_exact_half = query_index(
-            conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids
-        )
+        # Binary HNSW queries
+        if "binary-hnsw" in benchmarks:
+            print(
+                f"[Query] HNSW binary float32 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+            )
+            lat_hnsw_bin, rec_hnsw_bin = query_index(
+                conn,
+                tbl_vector,
+                "vector",
+                "binary_hnsw",
+                dim,
+                query_trunc,
+                baseline_ids,
+                explain_analyze=do_explain,
+            )
+            size_hnsw_bin = get_index_size_mb(conn, idx_hnsw_bin)
 
-        # New: exact-binary NumPy rerank with fixed 10x overfetch
-        print(f"[Query] Exact binary NumPy rerank float32 (10x overfetch)...")
-        lat_bin_exact_np10_vec, rec_bin_exact_np10_vec = query_index(
-            conn,
-            tbl_vector,
-            "vector",
-            "binary_exact_np10",
-            dim,
-            query_trunc,
-            baseline_ids,
-        )
-        print(f"[Query] Exact binary NumPy rerank float16 (10x overfetch)...")
-        lat_bin_exact_np10_half, rec_bin_exact_np10_half = query_index(
-            conn,
-            tbl_half,
-            "halfvec",
-            "binary_exact_np10",
-            dim,
-            query_trunc,
-            baseline_ids,
-        )
+            print(
+                f"[Query] HNSW binary float16 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+            )
+            lat_hnsw_bin_half, rec_hnsw_bin_half = query_index(
+                conn,
+                tbl_half,
+                "halfvec",
+                "binary_hnsw",
+                dim,
+                query_trunc,
+                baseline_ids,
+                explain_analyze=do_explain,
+            )
+            size_hnsw_bin_half = get_index_size_mb(conn, idx_hnsw_bin_half)
 
-        # Keep exact-binary (1x) for reference (no rerank; pure Hamming)
-        print(f"[Query] Exact binary float32 (1x, no rerank)...")
-        lat_bin_exact_k_vec, rec_bin_exact_k_vec = query_index(
-            conn, tbl_vector, "vector", "binary_exact_k", dim, query_trunc, baseline_ids
-        )
-        print(f"[Query] Exact binary float16 (1x, no rerank)...")
-        lat_bin_exact_k_half, rec_bin_exact_k_half = query_index(
-            conn, tbl_half, "halfvec", "binary_exact_k", dim, query_trunc, baseline_ids
-        )
+            if args.enable_mean_binarization:
+                print(
+                    f"[Query] HNSW binary MEAN float32 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_hnsw_bin_mean, rec_hnsw_bin_mean = query_index(
+                    conn,
+                    tbl_vector,
+                    "vector",
+                    "binary_hnsw",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_mean_bin=True,
+                    dimension_means=dimension_means_1024,
+                )
+                size_hnsw_bin_mean = get_index_size_mb(conn, idx_hnsw_bin_mean)
 
-        # Add back exact retrieval (sequential, no index)
-        print("[Query] Exact float32 (sequential, no index)...")
-        lat_exact_vec, rec_exact_vec = query_index(
-            conn,
-            tbl_vector,
-            "vector",
-            "exact",
-            dim,
-            query_trunc,
-            baseline_ids,
-            explain_analyze=do_explain,
-        )
-        print("[Query] Exact float16 (sequential, no index)...")
-        lat_exact_half, rec_exact_half = query_index(
-            conn,
-            tbl_half,
-            "halfvec",
-            "exact",
-            dim,
-            query_trunc,
-            baseline_ids,
-            explain_analyze=do_explain,
-        )
+                print(
+                    f"[Query] HNSW binary MEAN float16 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_hnsw_bin_half_mean, rec_hnsw_bin_half_mean = query_index(
+                    conn,
+                    tbl_half,
+                    "halfvec",
+                    "binary_hnsw",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_mean_bin=True,
+                    dimension_means=dimension_means_1024,
+                )
+                size_hnsw_bin_half_mean = get_index_size_mb(conn, idx_hnsw_bin_half_mean)
+
+        # Binary IVFFlat queries
+        if "binary-ivf" in benchmarks:
+            print(
+                f"[Query] IVFFlat binary float32 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+            )
+            lat_ivf_bin, rec_ivf_bin = query_index(
+                conn,
+                tbl_vector,
+                "vector",
+                "binary_ivf",
+                dim,
+                query_trunc,
+                baseline_ids,
+                explain_analyze=do_explain,
+            )
+            size_ivf_bin = get_index_size_mb(conn, idx_ivf_bin)
+
+            print(
+                f"[Query] IVFFlat binary float16 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+            )
+            lat_ivf_bin_half, rec_ivf_bin_half = query_index(
+                conn,
+                tbl_half,
+                "halfvec",
+                "binary_ivf",
+                dim,
+                query_trunc,
+                baseline_ids,
+                explain_analyze=do_explain,
+            )
+            size_ivf_bin_half = get_index_size_mb(conn, idx_ivf_bin_half)
+
+            if args.enable_mean_binarization:
+                print(
+                    f"[Query] IVFFlat binary MEAN float32 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_ivf_bin_mean, rec_ivf_bin_mean = query_index(
+                    conn,
+                    tbl_vector,
+                    "vector",
+                    "binary_ivf",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_mean_bin=True,
+                    dimension_means=dimension_means_1024,
+                )
+                size_ivf_bin_mean = get_index_size_mb(conn, idx_ivf_bin_mean)
+
+                print(
+                    f"[Query] IVFFlat binary MEAN float16 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_ivf_bin_half_mean, rec_ivf_bin_half_mean = query_index(
+                    conn,
+                    tbl_half,
+                    "halfvec",
+                    "binary_ivf",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_mean_bin=True,
+                    dimension_means=dimension_means_1024,
+                )
+                size_ivf_bin_half_mean = get_index_size_mb(conn, idx_ivf_bin_half_mean)
+
+        # Binary exact queries
+        if "binary-exact" in benchmarks:
+            # Exact binary (no binary index) + rerank
+            print(f"[Query] Exact binary float32 rerank ({OVERFETCH_FACTOR}x overfetch)...")
+            lat_bin_exact_vec, rec_bin_exact_vec = query_index(
+                conn, tbl_vector, "vector", "binary_exact", dim, query_trunc, baseline_ids
+            )
+            print(f"[Query] Exact binary float16 rerank ({OVERFETCH_FACTOR}x overfetch)...")
+            lat_bin_exact_half, rec_bin_exact_half = query_index(
+                conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids
+            )
+
+            # New: exact-binary NumPy rerank with fixed 10x overfetch
+            print(f"[Query] Exact binary NumPy rerank float32 (10x overfetch)...")
+            lat_bin_exact_np10_vec, rec_bin_exact_np10_vec = query_index(
+                conn,
+                tbl_vector,
+                "vector",
+                "binary_exact_np10",
+                dim,
+                query_trunc,
+                baseline_ids,
+            )
+            print(f"[Query] Exact binary NumPy rerank float16 (10x overfetch)...")
+            lat_bin_exact_np10_half, rec_bin_exact_np10_half = query_index(
+                conn,
+                tbl_half,
+                "halfvec",
+                "binary_exact_np10",
+                dim,
+                query_trunc,
+                baseline_ids,
+            )
+
+            # Keep exact-binary (1x) for reference (no rerank; pure Hamming)
+            print(f"[Query] Exact binary float32 (1x, no rerank)...")
+            lat_bin_exact_k_vec, rec_bin_exact_k_vec = query_index(
+                conn, tbl_vector, "vector", "binary_exact_k", dim, query_trunc, baseline_ids
+            )
+            print(f"[Query] Exact binary float16 (1x, no rerank)...")
+            lat_bin_exact_k_half, rec_bin_exact_k_half = query_index(
+                conn, tbl_half, "halfvec", "binary_exact_k", dim, query_trunc, baseline_ids
+            )
+
+            if args.enable_mean_binarization:
+                # Mean-based binary exact queries
+                print(f"[Query] Exact binary MEAN float32 rerank ({OVERFETCH_FACTOR}x overfetch)...")
+                lat_bin_exact_vec_mean, rec_bin_exact_vec_mean = query_index(
+                    conn, tbl_vector, "vector", "binary_exact", dim, query_trunc, baseline_ids,
+                    use_mean_bin=True, dimension_means=dimension_means_1024
+                )
+                print(f"[Query] Exact binary MEAN float16 rerank ({OVERFETCH_FACTOR}x overfetch)...")
+                lat_bin_exact_half_mean, rec_bin_exact_half_mean = query_index(
+                    conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids,
+                    use_mean_bin=True, dimension_means=dimension_means_1024
+                )
+
+        # Exact (sequential) queries
+        if "exact" in benchmarks:
+            # Add back exact retrieval (sequential, no index)
+            print("[Query] Exact float32 (sequential, no index)...")
+            lat_exact_vec, rec_exact_vec = query_index(
+                conn,
+                tbl_vector,
+                "vector",
+                "exact",
+                dim,
+                query_trunc,
+                baseline_ids,
+                explain_analyze=do_explain,
+            )
+            print("[Query] Exact float16 (sequential, no index)...")
+            lat_exact_half, rec_exact_half = query_index(
+                conn,
+                tbl_half,
+                "halfvec",
+                "exact",
+                dim,
+                query_trunc,
+                baseline_ids,
+                explain_analyze=do_explain,
+            )
 
         # Calculate storage sizes
         storage_vec_mb = get_vector_storage_mb(num_vectors, dim, "float32")
         storage_half_mb = get_vector_storage_mb(num_vectors, dim, "float16")
 
-        results.extend(
-            [
-                {
+        # Collect results (conditionally based on which benchmarks ran)
+        if "vchordrq" in benchmarks:
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": "vchordrq",
+                "lat_ms": lat_vchord_vec * 1000,
+                "recall": rec_vchord_vec,
+                "build_s": t_vchord_vec,
+                "index_mb": size_vchord_vec,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": "vchordrq",
+                "lat_ms": lat_vchord_half * 1000,
+                "recall": rec_vchord_half,
+                "build_s": t_vchord_half,
+                "index_mb": size_vchord_half,
+                "storage_mb": storage_half_mb,
+            })
+
+        if "ivfflat" in benchmarks:
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
+                "lat_ms": lat_ivf_vec * 1000,
+                "recall": rec_ivf_vec,
+                "build_s": t_ivf_vec,
+                "index_mb": size_ivf_vec,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
+                "lat_ms": lat_ivf_half * 1000,
+                "recall": rec_ivf_half,
+                "build_s": t_ivf_half,
+                "index_mb": size_ivf_half,
+                "storage_mb": storage_half_mb,
+            })
+
+        if "binary-hnsw" in benchmarks:
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                "lat_ms": lat_hnsw_bin * 1000,
+                "recall": rec_hnsw_bin,
+                "build_s": t_hnsw_bin,
+                "index_mb": size_hnsw_bin,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                "lat_ms": lat_hnsw_bin_half * 1000,
+                "recall": rec_hnsw_bin_half,
+                "build_s": t_hnsw_bin_half,
+                "index_mb": size_hnsw_bin_half,
+                "storage_mb": storage_half_mb,
+            })
+
+            if args.enable_mean_binarization:
+                results.append({
                     "dim": dim,
                     "storage": "float32",
-                    "index": "vchordrq",
-                    "lat_ms": lat_vchord_vec * 1000,
-                    "recall": rec_vchord_vec,
-                    "build_s": t_vchord_vec,
-                    "index_mb": size_vchord_vec,
+                    "index": f"hnsw+binary-mean(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin_mean * 1000,
+                    "recall": rec_hnsw_bin_mean,
+                    "build_s": t_hnsw_bin_mean,
+                    "index_mb": size_hnsw_bin_mean,
                     "storage_mb": storage_vec_mb,
-                },
-                {
+                })
+                results.append({
                     "dim": dim,
                     "storage": "float16",
-                    "index": "vchordrq",
-                    "lat_ms": lat_vchord_half * 1000,
-                    "recall": rec_vchord_half,
-                    "build_s": t_vchord_half,
-                    "index_mb": size_vchord_half,
+                    "index": f"hnsw+binary-mean(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin_half_mean * 1000,
+                    "recall": rec_hnsw_bin_half_mean,
+                    "build_s": t_hnsw_bin_half_mean,
+                    "index_mb": size_hnsw_bin_half_mean,
                     "storage_mb": storage_half_mb,
-                },
-                {
+                })
+
+        if "binary-ivf" in benchmarks:
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                "lat_ms": lat_ivf_bin * 1000,
+                "recall": rec_ivf_bin,
+                "build_s": t_ivf_bin,
+                "index_mb": size_ivf_bin,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                "lat_ms": lat_ivf_bin_half * 1000,
+                "recall": rec_ivf_bin_half,
+                "build_s": t_ivf_bin_half,
+                "index_mb": size_ivf_bin_half,
+                "storage_mb": storage_half_mb,
+            })
+
+            if args.enable_mean_binarization:
+                results.append({
                     "dim": dim,
                     "storage": "float32",
-                    "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
-                    "lat_ms": lat_ivf_vec * 1000,
-                    "recall": rec_ivf_vec,
-                    "build_s": t_ivf_vec,
-                    "index_mb": size_ivf_vec,
+                    "index": f"ivf+binary-mean(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin_mean * 1000,
+                    "recall": rec_ivf_bin_mean,
+                    "build_s": t_ivf_bin_mean,
+                    "index_mb": size_ivf_bin_mean,
                     "storage_mb": storage_vec_mb,
-                },
-                {
+                })
+                results.append({
                     "dim": dim,
                     "storage": "float16",
-                    "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
-                    "lat_ms": lat_ivf_half * 1000,
-                    "recall": rec_ivf_half,
-                    "build_s": t_ivf_half,
-                    "index_mb": size_ivf_half,
+                    "index": f"ivf+binary-mean(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin_half_mean * 1000,
+                    "recall": rec_ivf_bin_half_mean,
+                    "build_s": t_ivf_bin_half_mean,
+                    "index_mb": size_ivf_bin_half_mean,
                     "storage_mb": storage_half_mb,
-                },
-                {
+                })
+
+        if "binary-exact" in benchmarks:
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": f"exact-binary({OVERFETCH_FACTOR}x)",
+                "lat_ms": lat_bin_exact_vec * 1000,
+                "recall": rec_bin_exact_vec,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": f"exact-binary({OVERFETCH_FACTOR}x)",
+                "lat_ms": lat_bin_exact_half * 1000,
+                "recall": rec_bin_exact_half,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_half_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": "exact-binary+numpy(10x)",
+                "lat_ms": lat_bin_exact_np10_vec * 1000,
+                "recall": rec_bin_exact_np10_vec,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": "exact-binary+numpy(10x)",
+                "lat_ms": lat_bin_exact_np10_half * 1000,
+                "recall": rec_bin_exact_np10_half,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_half_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": "exact-binary(1x)",
+                "lat_ms": lat_bin_exact_k_vec * 1000,
+                "recall": rec_bin_exact_k_vec,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": "exact-binary(1x)",
+                "lat_ms": lat_bin_exact_k_half * 1000,
+                "recall": rec_bin_exact_k_half,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_half_mb,
+            })
+
+            if args.enable_mean_binarization:
+                results.append({
                     "dim": dim,
                     "storage": "float32",
-                    "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_hnsw_bin * 1000,
-                    "recall": rec_hnsw_bin,
-                    "build_s": t_hnsw_bin,
-                    "index_mb": size_hnsw_bin,
-                    "storage_mb": storage_vec_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float16",
-                    "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_hnsw_bin_half * 1000,
-                    "recall": rec_hnsw_bin_half,
-                    "build_s": t_hnsw_bin_half,
-                    "index_mb": size_hnsw_bin_half,
-                    "storage_mb": storage_half_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float32",
-                    "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_ivf_bin * 1000,
-                    "recall": rec_ivf_bin,
-                    "build_s": t_ivf_bin,
-                    "index_mb": size_ivf_bin,
-                    "storage_mb": storage_vec_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float16",
-                    "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_ivf_bin_half * 1000,
-                    "recall": rec_ivf_bin_half,
-                    "build_s": t_ivf_bin_half,
-                    "index_mb": size_ivf_bin_half,
-                    "storage_mb": storage_half_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float32",
-                    "index": f"exact-binary({OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_bin_exact_vec * 1000,
-                    "recall": rec_bin_exact_vec,
+                    "index": f"exact-binary-mean({OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_bin_exact_vec_mean * 1000,
+                    "recall": rec_bin_exact_vec_mean,
                     "build_s": 0.0,
                     "index_mb": 0.0,
                     "storage_mb": storage_vec_mb,
-                },
-                {
+                })
+                results.append({
                     "dim": dim,
                     "storage": "float16",
-                    "index": f"exact-binary({OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_bin_exact_half * 1000,
-                    "recall": rec_bin_exact_half,
+                    "index": f"exact-binary-mean({OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_bin_exact_half_mean * 1000,
+                    "recall": rec_bin_exact_half_mean,
                     "build_s": 0.0,
                     "index_mb": 0.0,
                     "storage_mb": storage_half_mb,
-                },
-                # New exact-binary NumPy (10x)
-                {
-                    "dim": dim,
-                    "storage": "float32",
-                    "index": "exact-binary+numpy(10x)",
-                    "lat_ms": lat_bin_exact_np10_vec * 1000,
-                    "recall": rec_bin_exact_np10_vec,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_vec_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float16",
-                    "index": "exact-binary+numpy(10x)",
-                    "lat_ms": lat_bin_exact_np10_half * 1000,
-                    "recall": rec_bin_exact_np10_half,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_half_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float32",
-                    "index": "exact-binary(1x)",
-                    "lat_ms": lat_bin_exact_k_vec * 1000,
-                    "recall": rec_bin_exact_k_vec,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_vec_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float16",
-                    "index": "exact-binary(1x)",
-                    "lat_ms": lat_bin_exact_k_half * 1000,
-                    "recall": rec_bin_exact_k_half,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_half_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float32",
-                    "index": "exact",
-                    "lat_ms": lat_exact_vec * 1000,
-                    "recall": rec_exact_vec,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_vec_mb,
-                },
-                {
-                    "dim": dim,
-                    "storage": "float16",
-                    "index": "exact",
-                    "lat_ms": lat_exact_half * 1000,
-                    "recall": rec_exact_half,
-                    "build_s": 0.0,
-                    "index_mb": 0.0,
-                    "storage_mb": storage_half_mb,
-                },
-            ]
-        )
+                })
+
+        if "exact" in benchmarks:
+            results.append({
+                "dim": dim,
+                "storage": "float32",
+                "index": "exact",
+                "lat_ms": lat_exact_vec * 1000,
+                "recall": rec_exact_vec,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_vec_mb,
+            })
+            results.append({
+                "dim": dim,
+                "storage": "float16",
+                "index": "exact",
+                "lat_ms": lat_exact_half * 1000,
+                "recall": rec_exact_half,
+                "build_s": 0.0,
+                "index_mb": 0.0,
+                "storage_mb": storage_half_mb,
+            })
 
     conn.close()
 
