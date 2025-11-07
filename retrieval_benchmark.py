@@ -29,6 +29,8 @@ import time
 from psycopg2.extras import execute_values
 from tqdm import tqdm
 import argparse
+import ast  # NEW: parse pgvector textual values
+
 
 DB_CONFIG = {
     "host": "localhost",
@@ -186,6 +188,27 @@ def build_index(conn, table: str, precision: str, kind: str, dim: int):
     return idx_name, build_time
 
 
+def _to_np_vec(val, dtype=np.float32):
+    # Already array
+    if isinstance(val, np.ndarray):
+        return val.astype(dtype, copy=False)
+    # Python sequence
+    if isinstance(val, (list, tuple)):
+        return np.array(val, dtype=dtype)
+    # Textual form '[..]' returned by psycopg2 for pgvector/halfvec
+    if isinstance(val, str):
+        return np.array(ast.literal_eval(val), dtype=dtype)
+    # Byte-like (rare): decode to str then parse
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        try:
+            s = bytes(val).decode()
+        except Exception:
+            s = str(val)
+        return np.array(ast.literal_eval(s), dtype=dtype)
+    # Fallback
+    return np.array(val, dtype=dtype)
+
+
 def query_index(
     conn,
     table: str,
@@ -249,10 +272,9 @@ def query_index(
         ids = [int(r[0]) for r in rows]
 
         if ids:
-            # Build candidate matrix from stored values
-            cands = np.stack([np.array(r[1], dtype=np.float32) for r in rows], axis=0)
+            # CHANGED: parse embeddings robustly from pgvector textual form
+            cands = np.stack([_to_np_vec(r[1], dtype=np.float32) for r in rows], axis=0)
 
-            # Emulate Postgres casting: halfvec path quantizes to fp16 then upcasts
             q = query_vec[:dim].astype(np.float32, copy=False)
             if precision == "halfvec":
                 cands = cands.astype(np.float16).astype(np.float32)
@@ -298,9 +320,11 @@ def query_index(
             ids = [int(r[0]) for r in rows]
 
             if ids:
+                # CHANGED: parse embeddings robustly from pgvector textual form
                 cands = np.stack(
-                    [np.array(r[1], dtype=np.float32) for r in rows], axis=0
+                    [_to_np_vec(r[1], dtype=np.float32) for r in rows], axis=0
                 )
+
                 q = query_vec[:dim].astype(np.float32, copy=False)
                 if precision == "halfvec":
                     cands = cands.astype(np.float16).astype(np.float32)
