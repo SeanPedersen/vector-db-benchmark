@@ -195,7 +195,7 @@ def query_index(
     query_vec: np.ndarray,
     baseline_ids,
     debug=False,
-    local_embeddings=None,  # New: optional local embeddings for NumPy rerank
+    local_embeddings=None,  # kept for backward compat; unused
 ):
     cursor = conn.cursor()
     # Prepare query textual forms
@@ -220,83 +220,110 @@ def query_index(
         rows = cursor.fetchall()
         retrieved = [r[0] for r in rows]
         latency = time.time() - start
-    elif kind == "binary_hnsw" or kind == "binary_ivf":
-        # Binary quantization: 1 bit per dimension (sign bit: >= 0 → 1, < 0 → 0)
-        # Step 1: Fast overfetch using Hamming distance on bit vectors (CTE)
-        # Step 2: Rerank candidates with full vector distance in SQL
-        overfetch = K * OVERFETCH_FACTOR  # 100 * 10 = 1000
+    elif kind in ("binary_hnsw", "binary_ivf", "binary_hnsw_numpy", "binary_ivf_numpy"):
+        # Binary overfetch with Hamming via index, then NumPy rerank on original embeddings
+        overfetch = K * OVERFETCH_FACTOR
 
-        # Set probes for IVFFlat binary (use higher value since Hamming is less accurate)
-        if kind == "binary_ivf":
+        # Configure index search params
+        if "ivf" in kind:
             cursor.execute(f"SET ivfflat.probes = {IVF_PROBES_BINARY}")
-
-        # Set ef_search for HNSW binary
-        if kind == "binary_hnsw":
+        else:
             cursor.execute(f"SET hnsw.ef_search = {HNSW_EF_SEARCH}")
 
-        # Build query: overfetch with Hamming, rerank with full distance
-        cast_type = "vector" if precision == "vector" else "halfvec"
-        query_sql = f"""
-        WITH candidates AS (
-            SELECT id
-            FROM {table}
-            ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
-            LIMIT {overfetch}
-        )
-        SELECT c.id
-        FROM candidates c
-        JOIN {table} t ON c.id = t.id
-        ORDER BY t.embedding <=> %s::{cast_type}
-        LIMIT {K}
+        # Fetch candidates and their stored embeddings in one query
+        candidate_sql = f"""
+        SELECT id, embedding
+        FROM {table}
+        ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
+        LIMIT {overfetch}
         """
 
         # Warm-up
-        cursor.execute(query_sql, (query_txt, query_txt))
+        cursor.execute(candidate_sql, (query_txt,))
         cursor.fetchall()
 
-        # Actual query
+        # Timed fetch + NumPy rerank
         start = time.time()
-        cursor.execute(query_sql, (query_txt, query_txt))
-        rows = cursor.fetchall()
-        retrieved = [r[0] for r in rows]
+        cursor.execute(candidate_sql, (query_txt,))
+        rows = cursor.fetchall()  # [(id, embedding), ...]
+        ids = [int(r[0]) for r in rows]
+
+        if ids:
+            # Build candidate matrix from stored values
+            cands = np.stack([np.array(r[1], dtype=np.float32) for r in rows], axis=0)
+
+            # Emulate Postgres casting: halfvec path quantizes to fp16 then upcasts
+            q = query_vec[:dim].astype(np.float32, copy=False)
+            if precision == "halfvec":
+                cands = cands.astype(np.float16).astype(np.float32)
+                q = q.astype(np.float16).astype(np.float32)
+
+            # Cosine distance: 1 - cosine_similarity
+            vnorms = np.linalg.norm(cands, axis=1)
+            qnorm = float(np.linalg.norm(q))
+            sims = (cands @ q) / (vnorms * qnorm + 1e-12)
+            dists = 1.0 - sims
+
+            n = min(K, dists.shape[0])
+            top_idx = np.argpartition(dists, n - 1)[:n]
+            order = np.argsort(dists[top_idx])
+            retrieved = [ids[i] for i in top_idx[order]]
+        else:
+            retrieved = []
+
         latency = time.time() - start
     elif kind == "binary_exact":
-        # Exact binary overfetch without using any binary index, then rerank
+        # Exact binary overfetch without using any binary index; then NumPy rerank
         overfetch = K * OVERFETCH_FACTOR
-        # Disable all index scans to ensure no binary index is used
         try:
             cursor.execute("SET enable_indexscan = off")
             cursor.execute("SET enable_bitmapscan = off")
+            cursor.execute("SET enable_indexonlyscan = off")
             cursor.execute("SET enable_seqscan = on")
 
-            cast_type = "vector" if precision == "vector" else "halfvec"
-            query_sql = f"""
-            WITH candidates AS (
-                SELECT id
-                FROM {table}
-                ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
-                LIMIT {overfetch}
-            )
-            SELECT c.id
-            FROM candidates c
-            JOIN {table} t ON c.id = t.id
-            ORDER BY t.embedding <=> %s::{cast_type}
-            LIMIT {K}
+            candidate_sql = f"""
+            SELECT id, embedding
+            FROM {table}
+            ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
+            LIMIT {overfetch}
             """
             # Warm-up
-            cursor.execute(query_sql, (query_txt, query_txt))
+            cursor.execute(candidate_sql, (query_txt,))
             cursor.fetchall()
-            # Actual query
+
+            # Timed fetch + NumPy rerank
             start = time.time()
-            cursor.execute(query_sql, (query_txt, query_txt))
+            cursor.execute(candidate_sql, (query_txt,))
             rows = cursor.fetchall()
-            retrieved = [r[0] for r in rows]
+            ids = [int(r[0]) for r in rows]
+
+            if ids:
+                cands = np.stack(
+                    [np.array(r[1], dtype=np.float32) for r in rows], axis=0
+                )
+                q = query_vec[:dim].astype(np.float32, copy=False)
+                if precision == "halfvec":
+                    cands = cands.astype(np.float16).astype(np.float32)
+                    q = q.astype(np.float16).astype(np.float32)
+
+                vnorms = np.linalg.norm(cands, axis=1)
+                qnorm = float(np.linalg.norm(q))
+                sims = (cands @ q) / (vnorms * qnorm + 1e-12)
+                dists = 1.0 - sims
+
+                n = min(K, dists.shape[0])
+                top_idx = np.argpartition(dists, n - 1)[:n]
+                order = np.argsort(dists[top_idx])
+                retrieved = [ids[i] for i in top_idx[order]]
+            else:
+                retrieved = []
+
             latency = time.time() - start
         finally:
-            # Restore planner settings
             try:
                 cursor.execute("SET enable_indexscan = on")
                 cursor.execute("SET enable_bitmapscan = on")
+                cursor.execute("SET enable_indexonlyscan = on")
                 cursor.execute("SET enable_seqscan = on")
             except Exception:
                 pass
@@ -332,55 +359,6 @@ def query_index(
                 cursor.execute("SET enable_seqscan = on")
             except Exception:
                 pass
-    elif kind in ("binary_hnsw_numpy", "binary_ivf_numpy"):
-        # Overfetch via Hamming using the binary index, then NumPy rerank by cosine
-        if local_embeddings is None:
-            raise ValueError("local_embeddings must be provided for NumPy rerank")
-        overfetch = K * OVERFETCH_FACTOR
-
-        # Configure planner for the candidate fetch phase
-        if kind == "binary_ivf_numpy":
-            cursor.execute(f"SET ivfflat.probes = {IVF_PROBES_BINARY}")
-        else:
-            cursor.execute(f"SET hnsw.ef_search = {HNSW_EF_SEARCH}")
-
-        # Candidate fetch SQL (only ids)
-        candidate_sql = f"""
-        SELECT id
-        FROM {table}
-        ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
-        LIMIT {overfetch}
-        """
-
-        # Warm-up: candidate fetch + NumPy rerank
-        cursor.execute(candidate_sql, (query_txt,))
-        warm_ids = [r[0] for r in cursor.fetchall()]
-        if warm_ids:
-            dtype = np.float16 if precision == "halfvec" else np.float32
-            q = query_vec.astype(dtype, copy=False)
-            cands = local_embeddings[np.array(warm_ids, dtype=np.int64)]
-            cands = cands.astype(dtype, copy=False)
-            _ = cands @ q  # warm up matmul
-
-        # Timed: candidate fetch + NumPy rerank
-        start = time.time()
-        cursor.execute(candidate_sql, (query_txt,))
-        ids = [r[0] for r in cursor.fetchall()]
-
-        if ids:
-            dtype = np.float16 if precision == "halfvec" else np.float32
-            q = query_vec.astype(dtype, copy=False)
-            cands = local_embeddings[np.array(ids, dtype=np.int64)]
-            cands = cands.astype(dtype, copy=False)
-            sims = cands @ q  # cosine similarity since inputs are normalized
-            n = min(K, sims.shape[0])
-            top_idx = np.argpartition(-sims, n - 1)[:n]
-            order = np.argsort(-sims[top_idx])
-            retrieved = [int(ids[i]) for i in top_idx[order]]
-        else:
-            retrieved = []
-
-        latency = time.time() - start
     else:
         # Warm-up
         cast_type = "vector" if precision == "vector" else "halfvec"
