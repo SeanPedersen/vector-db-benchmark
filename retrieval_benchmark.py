@@ -1139,25 +1139,25 @@ def main():
 
     # Print header
     print(
-        f"{'Dim':<{col_widths['dim']}} "
-        f"{'Storage':<{col_widths['storage']}} "
-        f"{'Index':<{col_widths['index']}} "
-        f"{'Latency':<{col_widths['lat_ms']}} "
-        f"{'Recall':<{col_widths['recall']}} "
-        f"{'Build':<{col_widths['build_s']}} "
-        f"{'Storage':<{col_widths['storage_mb']}} "
-        f"{'Index':<{col_widths['index_mb']}}"
+        f"| {'Dim':<{col_widths['dim']}} "
+        f"| {'Storage':<{col_widths['storage']}} "
+        f"| {'Index':<{col_widths['index']}} "
+        f"| {'Latency':<{col_widths['lat_ms']}} "
+        f"| {'Recall':<{col_widths['recall']}} "
+        f"| {'Build':<{col_widths['build_s']}} "
+        f"| {'Storage':<{col_widths['storage_mb']}} "
+        f"| {'Index':<{col_widths['index_mb']}} |"
     )
 
     print(
-        f"{'':>{col_widths['dim']}} "
-        f"{'':>{col_widths['storage']}} "
-        f"{'':>{col_widths['index']}} "
-        f"{'(ms)':>{col_widths['lat_ms']}} "
-        f"{'(%)':>{col_widths['recall']}} "
-        f"{'(s)':>{col_widths['build_s']}} "
-        f"{'(MB)':>{col_widths['storage_mb']}} "
-        f"{'(MB)':>{col_widths['index_mb']}}"
+        f"| {'':>{col_widths['dim']}} "
+        f"| {'':>{col_widths['storage']}} "
+        f"| {'':>{col_widths['index']}} "
+        f"| {'(ms)':>{col_widths['lat_ms']}} "
+        f"| {'(%)':>{col_widths['recall']}} "
+        f"| {'(s)':>{col_widths['build_s']}} "
+        f"| {'(MB)':>{col_widths['storage_mb']}} "
+        f"| {'(MB)':>{col_widths['index_mb']}} |"
     )
 
     print("-" * 140)
@@ -1171,14 +1171,14 @@ def main():
             current_dim = r["dim"]
 
         print(
-            f"{r['dim']:<{col_widths['dim']}} "
-            f"{r['storage']:<{col_widths['storage']}} "
-            f"{r['index']:<{col_widths['index']}} "
-            f"{r['lat_ms']:>{col_widths['lat_ms']}.2f} "
-            f"{r['recall'] * 100:>{col_widths['recall']}.1f} "
-            f"{r['build_s']:>{col_widths['build_s']}.2f} "
-            f"{r['storage_mb']:>{col_widths['storage_mb']}.1f} "
-            f"{r['index_mb']:>{col_widths['index_mb']}.1f}"
+            f"| {r['dim']:<{col_widths['dim']}} "
+            f"| {r['storage']:<{col_widths['storage']}} "
+            f"| {r['index']:<{col_widths['index']}} "
+            f"| {r['lat_ms']:>{col_widths['lat_ms']}.2f} "
+            f"| {r['recall'] * 100:>{col_widths['recall']}.1f} "
+            f"| {r['build_s']:>{col_widths['build_s']}.2f} "
+            f"| {r['storage_mb']:>{col_widths['storage_mb']}.1f} "
+            f"| {r['index_mb']:>{col_widths['index_mb']}.1f} |"
         )
 
     print("=" * 140)
