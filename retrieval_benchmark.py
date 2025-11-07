@@ -1062,6 +1062,13 @@ def main():
         action="store_true",
         help="Enable quasi-uint4 binarization (4 buckets per dimension using percentile thresholds, thermometer encoding)",
     )
+    parser.add_argument(
+        "--dimensions",
+        "--dims",
+        type=str,
+        default="256,512,1024",
+        help="Comma-separated list of dimensions to test (default: 256,512,1024). Must not exceed vector dimensions.",
+    )
 
     args = parser.parse_args()
 
@@ -1182,6 +1189,23 @@ def main():
     else:
         print(f"[Setup] Generating {num_vectors:,} normalized 1024-d embeddings...")
         full_embeddings = generate_embeddings(num_vectors)
+
+    # Parse and validate dimensions to test
+    try:
+        requested_dims = [int(d.strip()) for d in args.dimensions.split(",")]
+    except ValueError:
+        print(f"[Error] Invalid dimensions format: '{args.dimensions}'. Expected comma-separated integers.")
+        return
+
+    max_dim = full_embeddings.shape[1]
+    invalid_dims = [d for d in requested_dims if d > max_dim or d <= 0]
+    if invalid_dims:
+        print(f"[Error] Invalid dimensions {invalid_dims}: must be positive and not exceed vector dimensions ({max_dim})")
+        return
+
+    # Use requested dimensions (sorted for consistency)
+    DIMENSIONS = sorted(requested_dims)
+    print(f"[Setup] Testing dimensions: {DIMENSIONS}")
 
     # Compute dimension means for mean-based binarization if enabled
     dimension_means_1024 = None
