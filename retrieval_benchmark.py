@@ -109,16 +109,13 @@ def binarize_with_means(embeddings: np.ndarray, means: np.ndarray):
 
 
 def numpy_binary_to_postgres_bit_string(binary_array: np.ndarray):
-    """Convert numpy binary array to PostgreSQL bit string format.
+    """Convert numpy binary array to PostgreSQL bit string payload.
 
-    Args:
-        binary_array: 1D numpy array of 0s and 1s
-
-    Returns:
-        String in format 'B10101...' for PostgreSQL bit type
+    Returns the raw bit digits without the B'..' wrapper so it can be safely
+    bound as a parameter and cast using %s::bit(n) in SQL.
     """
-    bit_string = ''.join(binary_array.astype(str))
-    return f"B'{bit_string}'"
+    bit_string = "".join(binary_array.astype(str))
+    return bit_string
 
 
 def build_baseline(full_embeddings: np.ndarray, query: np.ndarray):
@@ -131,7 +128,9 @@ def ensure_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 
-def table_exists_and_populated(conn, table_name: str, expected_rows: int, check_mean_bin=False):
+def table_exists_and_populated(
+    conn, table_name: str, expected_rows: int, check_mean_bin=False
+):
     """Check if table exists and has the expected number of rows."""
     cursor = conn.cursor()
     try:
@@ -182,7 +181,14 @@ def table_exists_and_populated(conn, table_name: str, expected_rows: int, check_
         return False
 
 
-def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: str, use_mean_binarization=False, dimension_means=None):
+def create_and_insert_table(
+    conn,
+    name: str,
+    embeddings: np.ndarray,
+    precision: str,
+    use_mean_binarization=False,
+    dimension_means=None,
+):
     cursor = conn.cursor()
     cursor.execute(f"DROP TABLE IF EXISTS {name}")
     dim = embeddings.shape[1]
@@ -241,7 +247,7 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
                 cursor,
                 f"INSERT INTO {name} (id, embedding, embedding_bin_mean) VALUES %s",
                 batch_data,
-                template=f"(%s, %s{cast}, %s)",
+                template=f"(%s, %s{cast}, %s::bit({dim}))",
             )
         else:
             batch_data = [
@@ -265,7 +271,9 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
     cursor.close()
 
 
-def build_index(conn, table: str, precision: str, kind: str, dim: int, use_mean_bin=False):
+def build_index(
+    conn, table: str, precision: str, kind: str, dim: int, use_mean_bin=False
+):
     cursor = conn.cursor()
     if kind == "binary_hnsw":
         bin_col = "embedding_bin_mean" if use_mean_bin else "embedding_bin"
@@ -421,7 +429,9 @@ def query_index(
 
             # Optional EXPLAIN ANALYZE for debugging
             if explain_analyze:
-                print(f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}, mean-bin):")
+                print(
+                    f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}, mean-bin):"
+                )
                 explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) " + sql
                 cursor.execute(explain_sql, (query_bin_str, query_txt))
                 for row in cursor.fetchall():
@@ -774,16 +784,22 @@ def main():
 
     # NEW: Benchmark selection via positive selection
     parser.add_argument(
-        "--benchmark", "-b",
+        "--benchmark",
+        "-b",
         action="append",
         choices=[
-            "vchordrq", "vchord",
-            "ivfflat", "ivf",
-            "binary-hnsw", "hnsw-bin",
-            "binary-ivf", "ivf-bin",
-            "binary-exact", "exact-bin",
+            "vchordrq",
+            "vchord",
+            "ivfflat",
+            "ivf",
+            "binary-hnsw",
+            "hnsw-bin",
+            "binary-ivf",
+            "ivf-bin",
+            "binary-exact",
+            "exact-bin",
             "exact",
-            "all"
+            "all",
         ],
         help=(
             "Benchmarks to run (can be specified multiple times). "
@@ -803,7 +819,14 @@ def main():
     # Process benchmark selection
     if args.benchmark is None or "all" in args.benchmark:
         # Default: run all benchmarks
-        benchmarks = {"vchordrq", "ivfflat", "binary-hnsw", "binary-ivf", "binary-exact", "exact"}
+        benchmarks = {
+            "vchordrq",
+            "ivfflat",
+            "binary-hnsw",
+            "binary-ivf",
+            "binary-exact",
+            "exact",
+        }
     else:
         # Normalize benchmark names (handle aliases)
         benchmarks = set()
@@ -916,7 +939,9 @@ def main():
         print("[Setup] Computing dimension-wise means for mean-based binarization...")
         dimension_means_1024 = compute_dimension_means(full_embeddings)
         print(f"[Setup] Computed means for all 1024 dimensions")
-        print(f"[Setup] Mean range: [{dimension_means_1024.min():.6f}, {dimension_means_1024.max():.6f}]")
+        print(
+            f"[Setup] Mean range: [{dimension_means_1024.min():.6f}, {dimension_means_1024.max():.6f}]"
+        )
 
     # Use a random vector from the dataset as the query (more realistic)
     print("[Setup] Selecting random query vector from dataset...")
@@ -999,14 +1024,23 @@ def main():
         tbl_half = f"items_half_{dim}"
 
         # Check if tables already exist and are populated
-        vec_exists = table_exists_and_populated(conn, tbl_vector, num_vectors, check_mean_bin=args.enable_mean_binarization)
-        half_exists = table_exists_and_populated(conn, tbl_half, num_vectors, check_mean_bin=args.enable_mean_binarization)
+        vec_exists = table_exists_and_populated(
+            conn, tbl_vector, num_vectors, check_mean_bin=args.enable_mean_binarization
+        )
+        half_exists = table_exists_and_populated(
+            conn, tbl_half, num_vectors, check_mean_bin=args.enable_mean_binarization
+        )
 
         if args.force_reload or not vec_exists:
             print(f"[Storage] Creating + inserting float32 table {tbl_vector} ...")
-            create_and_insert_table(conn, tbl_vector, trunc_embeddings, "vector",
-                                   use_mean_binarization=args.enable_mean_binarization,
-                                   dimension_means=dimension_means_1024)
+            create_and_insert_table(
+                conn,
+                tbl_vector,
+                trunc_embeddings,
+                "vector",
+                use_mean_binarization=args.enable_mean_binarization,
+                dimension_means=dimension_means_1024,
+            )
         else:
             print(
                 f"[Storage] Skipping {tbl_vector} (already populated with {num_vectors:,} rows)"
@@ -1014,9 +1048,14 @@ def main():
 
         if args.force_reload or not half_exists:
             print(f"[Storage] Creating + inserting float16 table {tbl_half} ...")
-            create_and_insert_table(conn, tbl_half, trunc_embeddings, "halfvec",
-                                   use_mean_binarization=args.enable_mean_binarization,
-                                   dimension_means=dimension_means_1024)
+            create_and_insert_table(
+                conn,
+                tbl_half,
+                trunc_embeddings,
+                "halfvec",
+                use_mean_binarization=args.enable_mean_binarization,
+                dimension_means=dimension_means_1024,
+            )
         else:
             print(
                 f"[Storage] Skipping {tbl_half} (already populated with {num_vectors:,} rows)"
@@ -1042,7 +1081,9 @@ def main():
             print(f"[Index] Building IVFFlat (vector, lists={IVF_LISTS})...")
             idx_ivf_vec, t_ivf_vec = build_index(conn, tbl_vector, "vector", "ivf", dim)
             print(f"[Index] Building IVFFlat (halfvec, lists={IVF_LISTS})...")
-            idx_ivf_half, t_ivf_half = build_index(conn, tbl_half, "halfvec", "ivf", dim)
+            idx_ivf_half, t_ivf_half = build_index(
+                conn, tbl_half, "halfvec", "ivf", dim
+            )
         else:
             idx_ivf_vec, t_ivf_vec = None, 0.0
             idx_ivf_half, t_ivf_half = None, 0.0
@@ -1208,7 +1249,9 @@ def main():
                     use_mean_bin=True,
                     dimension_means=dimension_means_1024,
                 )
-                size_hnsw_bin_half_mean = get_index_size_mb(conn, idx_hnsw_bin_half_mean)
+                size_hnsw_bin_half_mean = get_index_size_mb(
+                    conn, idx_hnsw_bin_half_mean
+                )
 
         # Binary IVFFlat queries
         if "binary-ivf" in benchmarks:
@@ -1280,13 +1323,29 @@ def main():
         # Binary exact queries
         if "binary-exact" in benchmarks:
             # Exact binary (no binary index) + rerank
-            print(f"[Query] Exact binary float32 rerank ({OVERFETCH_FACTOR}x overfetch)...")
-            lat_bin_exact_vec, rec_bin_exact_vec = query_index(
-                conn, tbl_vector, "vector", "binary_exact", dim, query_trunc, baseline_ids
+            print(
+                f"[Query] Exact binary float32 rerank ({OVERFETCH_FACTOR}x overfetch)..."
             )
-            print(f"[Query] Exact binary float16 rerank ({OVERFETCH_FACTOR}x overfetch)...")
+            lat_bin_exact_vec, rec_bin_exact_vec = query_index(
+                conn,
+                tbl_vector,
+                "vector",
+                "binary_exact",
+                dim,
+                query_trunc,
+                baseline_ids,
+            )
+            print(
+                f"[Query] Exact binary float16 rerank ({OVERFETCH_FACTOR}x overfetch)..."
+            )
             lat_bin_exact_half, rec_bin_exact_half = query_index(
-                conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids
+                conn,
+                tbl_half,
+                "halfvec",
+                "binary_exact",
+                dim,
+                query_trunc,
+                baseline_ids,
             )
 
             # New: exact-binary NumPy rerank with fixed 10x overfetch
@@ -1314,24 +1373,54 @@ def main():
             # Keep exact-binary (1x) for reference (no rerank; pure Hamming)
             print(f"[Query] Exact binary float32 (1x, no rerank)...")
             lat_bin_exact_k_vec, rec_bin_exact_k_vec = query_index(
-                conn, tbl_vector, "vector", "binary_exact_k", dim, query_trunc, baseline_ids
+                conn,
+                tbl_vector,
+                "vector",
+                "binary_exact_k",
+                dim,
+                query_trunc,
+                baseline_ids,
             )
             print(f"[Query] Exact binary float16 (1x, no rerank)...")
             lat_bin_exact_k_half, rec_bin_exact_k_half = query_index(
-                conn, tbl_half, "halfvec", "binary_exact_k", dim, query_trunc, baseline_ids
+                conn,
+                tbl_half,
+                "halfvec",
+                "binary_exact_k",
+                dim,
+                query_trunc,
+                baseline_ids,
             )
 
             if args.enable_mean_binarization:
                 # Mean-based binary exact queries
-                print(f"[Query] Exact binary MEAN float32 rerank ({OVERFETCH_FACTOR}x overfetch)...")
-                lat_bin_exact_vec_mean, rec_bin_exact_vec_mean = query_index(
-                    conn, tbl_vector, "vector", "binary_exact", dim, query_trunc, baseline_ids,
-                    use_mean_bin=True, dimension_means=dimension_means_1024
+                print(
+                    f"[Query] Exact binary MEAN float32 rerank ({OVERFETCH_FACTOR}x overfetch)..."
                 )
-                print(f"[Query] Exact binary MEAN float16 rerank ({OVERFETCH_FACTOR}x overfetch)...")
+                lat_bin_exact_vec_mean, rec_bin_exact_vec_mean = query_index(
+                    conn,
+                    tbl_vector,
+                    "vector",
+                    "binary_exact",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    use_mean_bin=True,
+                    dimension_means=dimension_means_1024,
+                )
+                print(
+                    f"[Query] Exact binary MEAN float16 rerank ({OVERFETCH_FACTOR}x overfetch)..."
+                )
                 lat_bin_exact_half_mean, rec_bin_exact_half_mean = query_index(
-                    conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids,
-                    use_mean_bin=True, dimension_means=dimension_means_1024
+                    conn,
+                    tbl_half,
+                    "halfvec",
+                    "binary_exact",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    use_mean_bin=True,
+                    dimension_means=dimension_means_1024,
                 )
 
         # Exact (sequential) queries
@@ -1366,242 +1455,286 @@ def main():
 
         # Collect results (conditionally based on which benchmarks ran)
         if "vchordrq" in benchmarks:
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": "vchordrq",
-                "lat_ms": lat_vchord_vec * 1000,
-                "recall": rec_vchord_vec,
-                "build_s": t_vchord_vec,
-                "index_mb": size_vchord_vec,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": "vchordrq",
-                "lat_ms": lat_vchord_half * 1000,
-                "recall": rec_vchord_half,
-                "build_s": t_vchord_half,
-                "index_mb": size_vchord_half,
-                "storage_mb": storage_half_mb,
-            })
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": "vchordrq",
+                    "lat_ms": lat_vchord_vec * 1000,
+                    "recall": rec_vchord_vec,
+                    "build_s": t_vchord_vec,
+                    "index_mb": size_vchord_vec,
+                    "storage_mb": storage_vec_mb,
+                }
+            )
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": "vchordrq",
+                    "lat_ms": lat_vchord_half * 1000,
+                    "recall": rec_vchord_half,
+                    "build_s": t_vchord_half,
+                    "index_mb": size_vchord_half,
+                    "storage_mb": storage_half_mb,
+                }
+            )
 
         if "ivfflat" in benchmarks:
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
-                "lat_ms": lat_ivf_vec * 1000,
-                "recall": rec_ivf_vec,
-                "build_s": t_ivf_vec,
-                "index_mb": size_ivf_vec,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
-                "lat_ms": lat_ivf_half * 1000,
-                "recall": rec_ivf_half,
-                "build_s": t_ivf_half,
-                "index_mb": size_ivf_half,
-                "storage_mb": storage_half_mb,
-            })
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
+                    "lat_ms": lat_ivf_vec * 1000,
+                    "recall": rec_ivf_vec,
+                    "build_s": t_ivf_vec,
+                    "index_mb": size_ivf_vec,
+                    "storage_mb": storage_vec_mb,
+                }
+            )
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
+                    "lat_ms": lat_ivf_half * 1000,
+                    "recall": rec_ivf_half,
+                    "build_s": t_ivf_half,
+                    "index_mb": size_ivf_half,
+                    "storage_mb": storage_half_mb,
+                }
+            )
 
         if "binary-hnsw" in benchmarks:
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_hnsw_bin * 1000,
-                "recall": rec_hnsw_bin,
-                "build_s": t_hnsw_bin,
-                "index_mb": size_hnsw_bin,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_hnsw_bin_half * 1000,
-                "recall": rec_hnsw_bin_half,
-                "build_s": t_hnsw_bin_half,
-                "index_mb": size_hnsw_bin_half,
-                "storage_mb": storage_half_mb,
-            })
-
-            if args.enable_mean_binarization:
-                results.append({
+            results.append(
+                {
                     "dim": dim,
                     "storage": "float32",
-                    "index": f"hnsw+binary-mean(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_hnsw_bin_mean * 1000,
-                    "recall": rec_hnsw_bin_mean,
-                    "build_s": t_hnsw_bin_mean,
-                    "index_mb": size_hnsw_bin_mean,
+                    "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin * 1000,
+                    "recall": rec_hnsw_bin,
+                    "build_s": t_hnsw_bin,
+                    "index_mb": size_hnsw_bin,
                     "storage_mb": storage_vec_mb,
-                })
-                results.append({
+                }
+            )
+            results.append(
+                {
                     "dim": dim,
                     "storage": "float16",
-                    "index": f"hnsw+binary-mean(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_hnsw_bin_half_mean * 1000,
-                    "recall": rec_hnsw_bin_half_mean,
-                    "build_s": t_hnsw_bin_half_mean,
-                    "index_mb": size_hnsw_bin_half_mean,
+                    "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin_half * 1000,
+                    "recall": rec_hnsw_bin_half,
+                    "build_s": t_hnsw_bin_half,
+                    "index_mb": size_hnsw_bin_half,
                     "storage_mb": storage_half_mb,
-                })
+                }
+            )
+
+            if args.enable_mean_binarization:
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float32",
+                        "index": f"hnsw+binary-mean(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_hnsw_bin_mean * 1000,
+                        "recall": rec_hnsw_bin_mean,
+                        "build_s": t_hnsw_bin_mean,
+                        "index_mb": size_hnsw_bin_mean,
+                        "storage_mb": storage_vec_mb,
+                    }
+                )
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float16",
+                        "index": f"hnsw+binary-mean(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_hnsw_bin_half_mean * 1000,
+                        "recall": rec_hnsw_bin_half_mean,
+                        "build_s": t_hnsw_bin_half_mean,
+                        "index_mb": size_hnsw_bin_half_mean,
+                        "storage_mb": storage_half_mb,
+                    }
+                )
 
         if "binary-ivf" in benchmarks:
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_ivf_bin * 1000,
-                "recall": rec_ivf_bin,
-                "build_s": t_ivf_bin,
-                "index_mb": size_ivf_bin,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_ivf_bin_half * 1000,
-                "recall": rec_ivf_bin_half,
-                "build_s": t_ivf_bin_half,
-                "index_mb": size_ivf_bin_half,
-                "storage_mb": storage_half_mb,
-            })
-
-            if args.enable_mean_binarization:
-                results.append({
+            results.append(
+                {
                     "dim": dim,
                     "storage": "float32",
-                    "index": f"ivf+binary-mean(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_ivf_bin_mean * 1000,
-                    "recall": rec_ivf_bin_mean,
-                    "build_s": t_ivf_bin_mean,
-                    "index_mb": size_ivf_bin_mean,
+                    "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin * 1000,
+                    "recall": rec_ivf_bin,
+                    "build_s": t_ivf_bin,
+                    "index_mb": size_ivf_bin,
                     "storage_mb": storage_vec_mb,
-                })
-                results.append({
+                }
+            )
+            results.append(
+                {
                     "dim": dim,
                     "storage": "float16",
-                    "index": f"ivf+binary-mean(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_ivf_bin_half_mean * 1000,
-                    "recall": rec_ivf_bin_half_mean,
-                    "build_s": t_ivf_bin_half_mean,
-                    "index_mb": size_ivf_bin_half_mean,
+                    "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin_half * 1000,
+                    "recall": rec_ivf_bin_half,
+                    "build_s": t_ivf_bin_half,
+                    "index_mb": size_ivf_bin_half,
                     "storage_mb": storage_half_mb,
-                })
+                }
+            )
+
+            if args.enable_mean_binarization:
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float32",
+                        "index": f"ivf+binary-mean(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_ivf_bin_mean * 1000,
+                        "recall": rec_ivf_bin_mean,
+                        "build_s": t_ivf_bin_mean,
+                        "index_mb": size_ivf_bin_mean,
+                        "storage_mb": storage_vec_mb,
+                    }
+                )
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float16",
+                        "index": f"ivf+binary-mean(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_ivf_bin_half_mean * 1000,
+                        "recall": rec_ivf_bin_half_mean,
+                        "build_s": t_ivf_bin_half_mean,
+                        "index_mb": size_ivf_bin_half_mean,
+                        "storage_mb": storage_half_mb,
+                    }
+                )
 
         if "binary-exact" in benchmarks:
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": f"exact-binary({OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_bin_exact_vec * 1000,
-                "recall": rec_bin_exact_vec,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": f"exact-binary({OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_bin_exact_half * 1000,
-                "recall": rec_bin_exact_half,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_half_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": "exact-binary+numpy(10x)",
-                "lat_ms": lat_bin_exact_np10_vec * 1000,
-                "recall": rec_bin_exact_np10_vec,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": "exact-binary+numpy(10x)",
-                "lat_ms": lat_bin_exact_np10_half * 1000,
-                "recall": rec_bin_exact_np10_half,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_half_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": "exact-binary(1x)",
-                "lat_ms": lat_bin_exact_k_vec * 1000,
-                "recall": rec_bin_exact_k_vec,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": "exact-binary(1x)",
-                "lat_ms": lat_bin_exact_k_half * 1000,
-                "recall": rec_bin_exact_k_half,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_half_mb,
-            })
-
-            if args.enable_mean_binarization:
-                results.append({
+            results.append(
+                {
                     "dim": dim,
                     "storage": "float32",
-                    "index": f"exact-binary-mean({OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_bin_exact_vec_mean * 1000,
-                    "recall": rec_bin_exact_vec_mean,
+                    "index": f"exact-binary({OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_bin_exact_vec * 1000,
+                    "recall": rec_bin_exact_vec,
                     "build_s": 0.0,
                     "index_mb": 0.0,
                     "storage_mb": storage_vec_mb,
-                })
-                results.append({
+                }
+            )
+            results.append(
+                {
                     "dim": dim,
                     "storage": "float16",
-                    "index": f"exact-binary-mean({OVERFETCH_FACTOR}x)",
-                    "lat_ms": lat_bin_exact_half_mean * 1000,
-                    "recall": rec_bin_exact_half_mean,
+                    "index": f"exact-binary({OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_bin_exact_half * 1000,
+                    "recall": rec_bin_exact_half,
                     "build_s": 0.0,
                     "index_mb": 0.0,
                     "storage_mb": storage_half_mb,
-                })
+                }
+            )
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": "exact-binary+numpy(10x)",
+                    "lat_ms": lat_bin_exact_np10_vec * 1000,
+                    "recall": rec_bin_exact_np10_vec,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_vec_mb,
+                }
+            )
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": "exact-binary+numpy(10x)",
+                    "lat_ms": lat_bin_exact_np10_half * 1000,
+                    "recall": rec_bin_exact_np10_half,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_half_mb,
+                }
+            )
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": "exact-binary(1x)",
+                    "lat_ms": lat_bin_exact_k_vec * 1000,
+                    "recall": rec_bin_exact_k_vec,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_vec_mb,
+                }
+            )
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": "exact-binary(1x)",
+                    "lat_ms": lat_bin_exact_k_half * 1000,
+                    "recall": rec_bin_exact_k_half,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_half_mb,
+                }
+            )
+
+            if args.enable_mean_binarization:
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float32",
+                        "index": f"exact-binary-mean({OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_bin_exact_vec_mean * 1000,
+                        "recall": rec_bin_exact_vec_mean,
+                        "build_s": 0.0,
+                        "index_mb": 0.0,
+                        "storage_mb": storage_vec_mb,
+                    }
+                )
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float16",
+                        "index": f"exact-binary-mean({OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_bin_exact_half_mean * 1000,
+                        "recall": rec_bin_exact_half_mean,
+                        "build_s": 0.0,
+                        "index_mb": 0.0,
+                        "storage_mb": storage_half_mb,
+                    }
+                )
 
         if "exact" in benchmarks:
-            results.append({
-                "dim": dim,
-                "storage": "float32",
-                "index": "exact",
-                "lat_ms": lat_exact_vec * 1000,
-                "recall": rec_exact_vec,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_vec_mb,
-            })
-            results.append({
-                "dim": dim,
-                "storage": "float16",
-                "index": "exact",
-                "lat_ms": lat_exact_half * 1000,
-                "recall": rec_exact_half,
-                "build_s": 0.0,
-                "index_mb": 0.0,
-                "storage_mb": storage_half_mb,
-            })
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": "exact",
+                    "lat_ms": lat_exact_vec * 1000,
+                    "recall": rec_exact_vec,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_vec_mb,
+                }
+            )
+            results.append(
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": "exact",
+                    "lat_ms": lat_exact_half * 1000,
+                    "recall": rec_exact_half,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_half_mb,
+                }
+            )
 
     conn.close()
 
