@@ -68,12 +68,17 @@ def recommend_ivf_params(num_vectors: int, k: int):
     """
     Heuristics:
     - lists in [50, 500], target ~ N/200 (e.g., 50K -> 250)
-    - probes ~ lists/12, clamped to [10, 50] (e.g., 250 -> ~20)
-    - binary probes ~ 3x probes, clamped to [30, 200]
+    - For small k (<= 200): probes ~ lists/16 clamped to [8, 40]
+    - For larger k (> 200): probes ~ lists/12 clamped to [10, 50]
+    - binary probes ~ 3x probes (small k: [24, 120], large k: [30, 200])
     """
     lists = _clamp(num_vectors // 200, 50, 500)
-    probes = _clamp(round(lists / 12), 10, 50)
-    probes_bin = _clamp(probes * 3, 30, 200)
+    if k <= 200:
+        probes = _clamp(round(lists / 16), 8, 40)
+        probes_bin = _clamp(probes * 3, 24, 120)
+    else:
+        probes = _clamp(round(lists / 12), 10, 50)
+        probes_bin = _clamp(probes * 3, 30, 200)
     return int(lists), int(probes), int(probes_bin)
 
 
@@ -565,8 +570,8 @@ def main():
     parser.add_argument(
         "--k",
         type=int,
-        default=1000,
-        help="Number of nearest neighbors to retrieve (default: 1000)",
+        default=100,
+        help="Number of nearest neighbors to retrieve (default: 100)",
     )
     # NEW: make IVFFlat params optional to enable auto-tuning
     parser.add_argument(
@@ -590,8 +595,8 @@ def main():
     parser.add_argument(
         "--hnsw-ef-search",
         type=int,
-        default=1500,
-        help="HNSW ef_search for binary index (should be >= overfetch; default: 1500)",
+        default=1000,
+        help="HNSW ef_search for binary index (should be >= overfetch; default: 1000)",
     )
     # NEW: cap for ef_search to satisfy server GUC range
     parser.add_argument(
@@ -742,6 +747,14 @@ def main():
         )
         print(
             "[Tips] increasing probes improves recall but slows queries; probes≈lists approaches exact search."
+        )
+    # NEW: concise IVFFlat tuning guidance for ~50K vectors and k≈100
+    elif num_vectors >= 50000 and K <= 200:
+        print(
+            "[Tips] IVFFlat: with ~50K vectors and k≈100, try lists in [200, 300] and probes≈12–20; "
+        )
+        print(
+            "[Tips] binary IVFFlat: set probes ~3x non-binary probes (e.g., 36–60). HNSW ef_search≈1000 works well with 10x overfetch."
         )
 
     conn = ensure_connection()
