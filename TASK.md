@@ -1,4 +1,4 @@
-# Implement retrival benchmark
+# Implement retrieval benchmark (implemented in retrieval_benchmark.py)
 
 The goal of this benchmark to compare different vector storage and index configurations of JINA CLIP v2 text embeddings - to find a configuration that maximizes recall and minimizes storage and retrieval times.
 
