@@ -170,6 +170,52 @@ def encode_thermometer(embeddings: np.ndarray, thresholds: np.ndarray, num_bits_
     return encoded
 
 
+def encode_one_hot(embeddings: np.ndarray, thresholds: np.ndarray, num_bits_per_dim: int = None):
+    """Encode vectors using one-hot/categorical code.
+
+    For each dimension, finds which bucket the value falls into and sets only that bit:
+    - Creates num_bits_per_dim bits per dimension (default: num_thresholds + 1)
+    - Only one bit is set to 1 per dimension (the bucket the value falls into)
+    - Example (8 buckets): value between threshold[2] and threshold[3] -> 00010000
+    - Example (4 buckets): value between threshold[1] and threshold[2] -> 0010
+
+    Args:
+        embeddings: (N, D) array of float vectors
+        thresholds: (D, num_thresholds) array of threshold values per dimension
+        num_bits_per_dim: Number of bits per dimension (default: num_thresholds + 1)
+
+    Returns: (N, D * num_bits_per_dim) binary array where each dimension is expanded
+    """
+    num_vectors, num_dims = embeddings.shape
+    num_thresholds = thresholds.shape[1]
+
+    # Default: use num_thresholds + 1 bits (e.g., 7 thresholds = 8 bits, 3 thresholds = 4 bits)
+    if num_bits_per_dim is None:
+        num_bits_per_dim = num_thresholds + 1
+
+    # Initialize output: N vectors x (D dimensions * num_bits_per_dim bits per dimension)
+    encoded = np.zeros((num_vectors, num_dims * num_bits_per_dim), dtype=np.uint8)
+
+    for dim in range(num_dims):
+        # For each vector, find which bucket it falls into
+        for vec_idx in range(num_vectors):
+            value = embeddings[vec_idx, dim]
+
+            # Find the bucket: count how many thresholds the value exceeds
+            bucket_idx = 0
+            for threshold_idx in range(num_thresholds):
+                if value >= thresholds[dim, threshold_idx]:
+                    bucket_idx = threshold_idx + 1
+                else:
+                    break
+
+            # Set only the bit for this bucket
+            bit_position = dim * num_bits_per_dim + bucket_idx
+            encoded[vec_idx, bit_position] = 1
+
+    return encoded
+
+
 def numpy_binary_to_postgres_bit_string(binary_array: np.ndarray):
     """Convert numpy binary array to PostgreSQL bit string payload.
 
@@ -284,6 +330,7 @@ def create_and_insert_table(
     uint8_thresholds=None,
     use_uint4_binarization=False,
     uint4_thresholds=None,
+    encoding_type="thermometer",
 ):
     cursor = conn.cursor()
     cursor.execute(f"DROP TABLE IF EXISTS {name}")
@@ -341,11 +388,14 @@ def create_and_insert_table(
     if use_mean_binarization and dimension_means is not None:
         binary_vecs_mean = binarize_with_means(embeddings[:, :dim], dimension_means[:dim])
 
+    # Select encoding function based on encoding_type parameter
+    encode_fn = encode_thermometer if encoding_type == "thermometer" else encode_one_hot
+
     if use_uint8_binarization and uint8_thresholds is not None:
-        binary_vecs_uint8 = encode_thermometer(embeddings[:, :dim], uint8_thresholds[:dim])
+        binary_vecs_uint8 = encode_fn(embeddings[:, :dim], uint8_thresholds[:dim])
 
     if use_uint4_binarization and uint4_thresholds is not None:
-        binary_vecs_uint4 = encode_thermometer(embeddings[:, :dim], uint4_thresholds[:dim])
+        binary_vecs_uint4 = encode_fn(embeddings[:, :dim], uint4_thresholds[:dim])
 
     for i in tqdm(
         range(0, embeddings.shape[0], BATCH_SIZE), desc=f"Insert {name}", unit="batch"
@@ -949,6 +999,20 @@ def get_vector_storage_mb(num_vectors: int, dimensions: int, precision: str):
     return (total_bytes * 1.1) / (1024.0 * 1024.0)
 
 
+def get_binary_storage_mb(num_vectors: int, dimensions: int, bits_per_dim: int):
+    """Calculate the storage size for binary vector data.
+
+    Args:
+        num_vectors: Number of vectors
+        dimensions: Number of dimensions
+        bits_per_dim: Number of bits per dimension (e.g., 8 for uint8, 4 for uint4)
+    """
+    total_bits = num_vectors * dimensions * bits_per_dim
+    total_bytes = total_bits / 8.0  # Convert bits to bytes
+    # Add ~10% overhead for PostgreSQL storage (TOAST, alignment, etc.)
+    return (total_bytes * 1.1) / (1024.0 * 1024.0)
+
+
 def main():
     global IVF_LISTS, IVF_PROBES, IVF_PROBES_BINARY, HNSW_EF_SEARCH, OVERFETCH_FACTOR, HNSW_M, HNSW_EF_CONSTRUCTION, K, HNSW_EF_SEARCH_MAX  # NEW: include HNSW_EF_SEARCH_MAX
 
@@ -1055,12 +1119,19 @@ def main():
     parser.add_argument(
         "--enable-quasi-uint8",
         action="store_true",
-        help="Enable quasi-uint8 binarization (8 buckets per dimension using percentile thresholds, thermometer encoding)",
+        help="Enable quasi-uint8 binarization (8 buckets per dimension using percentile thresholds)",
     )
     parser.add_argument(
         "--enable-quasi-uint4",
         action="store_true",
-        help="Enable quasi-uint4 binarization (4 buckets per dimension using percentile thresholds, thermometer encoding)",
+        help="Enable quasi-uint4 binarization (4 buckets per dimension using percentile thresholds)",
+    )
+    parser.add_argument(
+        "--encoding-type",
+        type=str,
+        choices=["thermometer", "one-hot"],
+        default="thermometer",
+        help="Encoding type for quasi-uint8 and quasi-uint4: 'thermometer' (unary) or 'one-hot' (categorical). Default: thermometer",
     )
     parser.add_argument(
         "--dimensions",
@@ -1344,6 +1415,7 @@ def main():
                 uint8_thresholds=uint8_thresholds_1024,
                 use_uint4_binarization=args.enable_quasi_uint4,
                 uint4_thresholds=uint4_thresholds_1024,
+                encoding_type=args.encoding_type,
             )
         else:
             print(
@@ -1363,6 +1435,7 @@ def main():
                 uint8_thresholds=uint8_thresholds_1024,
                 use_uint4_binarization=args.enable_quasi_uint4,
                 uint4_thresholds=uint4_thresholds_1024,
+                encoding_type=args.encoding_type,
             )
         else:
             print(
@@ -2001,6 +2074,10 @@ def main():
         storage_vec_mb = get_vector_storage_mb(num_vectors, dim, "float32")
         storage_half_mb = get_vector_storage_mb(num_vectors, dim, "float16")
 
+        # Calculate binary-only storage sizes (for exact queries that don't use float columns)
+        storage_uint8_mb = get_binary_storage_mb(num_vectors, dim, bits_per_dim=8)  # uint8: 8 bits per dimension
+        storage_uint4_mb = get_binary_storage_mb(num_vectors, dim, bits_per_dim=4)  # uint4: 4 bits per dimension
+
         # Collect results (conditionally based on which benchmarks ran)
         if "vchordrq" in benchmarks:
             results.append(
@@ -2339,54 +2416,58 @@ def main():
                 )
 
             if args.enable_quasi_uint8:
+                # Note: exact-binary-uint8(1x) only uses the binary column, not float columns
+                # So we use storage_uint8_mb which reflects only the binary column size
                 results.append(
                     {
                         "dim": dim,
-                        "storage": "float32",
+                        "storage": "binary-uint8",
                         "index": "exact-binary-uint8(1x)",
                         "lat_ms": lat_bin_exact_uint8_vec * 1000,
                         "recall": rec_bin_exact_uint8_vec,
                         "build_s": 0.0,
                         "index_mb": 0.0,
-                        "storage_mb": storage_vec_mb,
+                        "storage_mb": storage_uint8_mb,
                     }
                 )
                 results.append(
                     {
                         "dim": dim,
-                        "storage": "float16",
+                        "storage": "binary-uint8",
                         "index": "exact-binary-uint8(1x)",
                         "lat_ms": lat_bin_exact_uint8_half * 1000,
                         "recall": rec_bin_exact_uint8_half,
                         "build_s": 0.0,
                         "index_mb": 0.0,
-                        "storage_mb": storage_half_mb,
+                        "storage_mb": storage_uint8_mb,
                     }
                 )
 
             if args.enable_quasi_uint4:
+                # Note: exact-binary-uint4(1x) only uses the binary column, not float columns
+                # So we use storage_uint4_mb which reflects only the binary column size
                 results.append(
                     {
                         "dim": dim,
-                        "storage": "float32",
+                        "storage": "binary-uint4",
                         "index": "exact-binary-uint4(1x)",
                         "lat_ms": lat_bin_exact_uint4_vec * 1000,
                         "recall": rec_bin_exact_uint4_vec,
                         "build_s": 0.0,
                         "index_mb": 0.0,
-                        "storage_mb": storage_vec_mb,
+                        "storage_mb": storage_uint4_mb,
                     }
                 )
                 results.append(
                     {
                         "dim": dim,
-                        "storage": "float16",
+                        "storage": "binary-uint4",
                         "index": "exact-binary-uint4(1x)",
                         "lat_ms": lat_bin_exact_uint4_half * 1000,
                         "recall": rec_bin_exact_uint4_half,
                         "build_s": 0.0,
                         "index_mb": 0.0,
-                        "storage_mb": storage_half_mb,
+                        "storage_mb": storage_uint4_mb,
                     }
                 )
 
