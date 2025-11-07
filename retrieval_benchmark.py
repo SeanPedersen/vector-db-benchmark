@@ -782,24 +782,15 @@ def main():
         help="Print EXPLAIN ANALYZE output for query debugging (shows only for 512-D queries)",
     )
 
-    # NEW: Benchmark selection via positive selection
+    # NEW: Benchmark selection via positive selection (now supports comma-separated lists per -b)
     parser.add_argument(
         "--benchmark",
         "-b",
         action="append",
-        choices=[
-            "vchordrq",
-            "ivfflat",
-            "binary-hnsw",
-            "binary-ivf",
-            "binary-exact",
-            "exact",
-            "all",
-        ],
         help=(
-            "Benchmarks to run (can be specified multiple times). "
+            "Benchmarks to run (can be specified multiple times or as comma-separated list). "
             "Available: vchordrq, ivfflat, binary-hnsw, binary-ivf, binary-exact, exact, all. "
-            "Default: all benchmarks if not specified."
+            "Examples: -b binary-hnsw -b exact  |  -b binary-hnsw,binary-exact,ivfflat"
         ),
     )
     parser.add_argument(
@@ -810,18 +801,34 @@ def main():
 
     args = parser.parse_args()
 
-    # Process benchmark selection (aliases removed; only explicit names kept)
-    if args.benchmark is None or "all" in args.benchmark:
-        benchmarks = {
-            "vchordrq",
-            "ivfflat",
-            "binary-hnsw",
-            "binary-ivf",
-            "binary-exact",
-            "exact",
-        }
+    # Expand and validate benchmark selections (supports comma-separated values per -b)
+    allowed_benchmarks = {
+        "vchordrq",
+        "ivfflat",
+        "binary-hnsw",
+        "binary-ivf",
+        "binary-exact",
+        "exact",
+        "all",
+    }
+    raw_benchmarks = args.benchmark or []
+    expanded = []
+    for entry in raw_benchmarks:
+        for token in entry.split(","):
+            b = token.strip()
+            if not b:
+                continue
+            if b not in allowed_benchmarks:
+                # Use parser.error for consistent CLI error formatting
+                parser.error(
+                    f"Invalid benchmark '{b}'. Allowed: {', '.join(sorted(allowed_benchmarks))}"
+                )
+            expanded.append(b)
+
+    if not expanded or "all" in expanded:
+        benchmarks = allowed_benchmarks - {"all"}
     else:
-        benchmarks = set(args.benchmark)
+        benchmarks = set(expanded) - {"all"}
 
     print(f"[Setup] Running benchmarks: {', '.join(sorted(benchmarks))}")
 
