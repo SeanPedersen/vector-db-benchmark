@@ -4,6 +4,7 @@ Compare ANN indices: pgvectorscale hnsw, ivfflat, diskann with vectorchord vchor
 
 ## Usage
 
+- Start DB container: docker compose up -d
 - Activate uv env
 - Start benchmark: $ python run_benchmark.py
 - Reset DB's: $ bash reset_databases.sh
