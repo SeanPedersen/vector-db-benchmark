@@ -50,7 +50,11 @@ DIMENSIONS = [256, 512, 1024]  # Test Matryoshka embedding dimensions
 IVF_LISTS = 100  # Number of clusters (typically sqrt(num_vectors))
 IVF_PROBES = 10  # Number of clusters to search (higher = better recall, slower)
 IVF_PROBES_BINARY = 50  # Higher probes for binary (Hamming distance is less accurate)
-HNSW_EF_SEARCH = 200  # HNSW ef_search parameter for binary index
+HNSW_EF_SEARCH = 1500  # HNSW ef_search parameter for binary index (raise default; should be >= overfetch)
+
+# NEW: HNSW build parameters (recommended: M ~ 16-48, ef_construction ~ 200-400)
+HNSW_M = 32
+HNSW_EF_CONSTRUCTION = 300
 
 
 def generate_embeddings(num_vectors: int, full_dim: int = 1024):
@@ -173,9 +177,10 @@ def build_index(conn, table: str, precision: str, kind: str, dim: int):
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
         try:
-            # NEW: index the stored binary column directly
+            # NEW: index the stored binary column with HNSW build params
             cursor.execute(
-                f"CREATE INDEX {idx_name} ON {table} USING hnsw (embedding_bin bit_hamming_ops)"
+                f"CREATE INDEX {idx_name} ON {table} USING hnsw (embedding_bin bit_hamming_ops) "
+                f"WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION})"
             )
         except Exception:
             conn.rollback()
@@ -279,7 +284,9 @@ def query_index(
         if "ivf" in kind:
             cursor.execute(f"SET ivfflat.probes = {IVF_PROBES_BINARY}")
         else:
-            cursor.execute(f"SET hnsw.ef_search = {HNSW_EF_SEARCH}")
+            # NEW: ensure ef_search >= overfetch for better recall
+            eff = max(HNSW_EF_SEARCH, overfetch)
+            cursor.execute(f"SET hnsw.ef_search = {eff}")
 
         cand_sql = f"""
         SELECT id
@@ -517,7 +524,14 @@ def get_vector_storage_mb(num_vectors: int, dimensions: int, precision: str):
 
 
 def main():
-    global IVF_LISTS, IVF_PROBES, IVF_PROBES_BINARY, HNSW_EF_SEARCH, OVERFETCH_FACTOR
+    global \
+        IVF_LISTS, \
+        IVF_PROBES, \
+        IVF_PROBES_BINARY, \
+        HNSW_EF_SEARCH, \
+        OVERFETCH_FACTOR, \
+        HNSW_M, \
+        HNSW_EF_CONSTRUCTION
 
     parser = argparse.ArgumentParser(description="Retrieval benchmark (TASK.md)")
     parser.add_argument(
@@ -552,8 +566,21 @@ def main():
     parser.add_argument(
         "--hnsw-ef-search",
         type=int,
-        default=200,
-        help="HNSW ef_search for binary index (default: 200)",
+        default=1500,
+        help="HNSW ef_search for binary index (should be >= overfetch; default: 1500)",
+    )
+    # NEW: HNSW build knobs
+    parser.add_argument(
+        "--hnsw-m",
+        type=int,
+        default=32,
+        help="HNSW M (max links per node) for binary index (default: 32)",
+    )
+    parser.add_argument(
+        "--hnsw-ef-construction",
+        type=int,
+        default=300,
+        help="HNSW ef_construction for binary index build (default: 300)",
     )
     parser.add_argument(
         "--overfetch",
@@ -579,8 +606,18 @@ def main():
     IVF_LISTS = args.ivf_lists
     IVF_PROBES = args.ivf_probes
     IVF_PROBES_BINARY = args.ivf_probes_binary
-    HNSW_EF_SEARCH = args.hnsw_ef_search
     OVERFETCH_FACTOR = args.overfetch
+    HNSW_M = args.hnsw_m
+    HNSW_EF_CONSTRUCTION = args.hnsw_ef_construction
+    # Ensure ef_search >= overfetch (k) per HNSW guidance
+    required_ef = K * OVERFETCH_FACTOR
+    if args.hnsw_ef_search < required_ef:
+        print(
+            f"[Params] Adjusting hnsw_ef_search from {args.hnsw_ef_search} -> {required_ef} to match overfetch"
+        )
+        HNSW_EF_SEARCH = required_ef
+    else:
+        HNSW_EF_SEARCH = args.hnsw_ef_search
 
     # Load or generate embeddings
     if args.vectors_file:
@@ -644,7 +681,8 @@ def main():
     )
 
     print(
-        f"[Params] IVF: lists={IVF_LISTS}, probes={IVF_PROBES} (binary: {IVF_PROBES_BINARY}) | Binary: overfetch={OVERFETCH_FACTOR}x, hnsw_ef={HNSW_EF_SEARCH}"
+        f"[Params] IVF: lists={IVF_LISTS}, probes={IVF_PROBES} (binary: {IVF_PROBES_BINARY}) | "
+        f"Binary/HNSW: overfetch={OVERFETCH_FACTOR}x, m={HNSW_M}, ef_construction={HNSW_EF_CONSTRUCTION}, ef_search={HNSW_EF_SEARCH}"
     )
 
     conn = ensure_connection()
