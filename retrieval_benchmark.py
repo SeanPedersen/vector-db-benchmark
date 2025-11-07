@@ -108,6 +108,62 @@ def binarize_with_means(embeddings: np.ndarray, means: np.ndarray):
     return (embeddings >= means).astype(np.uint8)
 
 
+def compute_percentile_thresholds(embeddings: np.ndarray, num_buckets: int = 8):
+    """Compute percentile-based thresholds for quasi-uint8 quantization.
+
+    For num_buckets=8, computes 7 threshold values per dimension at percentiles:
+    [12.5, 25.0, 37.5, 50.0, 62.5, 75.0, 87.5]
+
+    Returns: np.ndarray of shape (num_dimensions, num_buckets-1)
+    """
+    num_dims = embeddings.shape[1]
+    num_thresholds = num_buckets - 1
+
+    # Compute percentiles for each bucket boundary
+    percentiles = np.linspace(100.0 / num_buckets, 100.0 * (num_buckets - 1) / num_buckets, num_thresholds)
+
+    # Compute thresholds for each dimension
+    thresholds = np.zeros((num_dims, num_thresholds), dtype=np.float32)
+    for dim in range(num_dims):
+        thresholds[dim] = np.percentile(embeddings[:, dim], percentiles)
+
+    return thresholds
+
+
+def encode_thermometer(embeddings: np.ndarray, thresholds: np.ndarray):
+    """Encode vectors using thermometer/unary code.
+
+    For each dimension, compares value against all thresholds:
+    - Creates 8 bits per dimension (for 7 thresholds)
+    - bit[i] = 1 if value >= threshold[i], else 0
+    - Example: value between threshold[2] and threshold[3] -> 11100000
+
+    Args:
+        embeddings: (N, D) array of float vectors
+        thresholds: (D, num_thresholds) array of threshold values per dimension
+
+    Returns: (N, D * 8) binary array where each dimension is expanded to 8 bits
+    """
+    num_vectors, num_dims = embeddings.shape
+    num_thresholds = thresholds.shape[1]
+    num_bits_per_dim = 8  # Fixed at 8 for quasi-uint8
+
+    # Initialize output: N vectors x (D dimensions * 8 bits per dimension)
+    encoded = np.zeros((num_vectors, num_dims * num_bits_per_dim), dtype=np.uint8)
+
+    for dim in range(num_dims):
+        # For this dimension, compare all vectors against all thresholds
+        for bit_idx in range(num_thresholds):
+            # Set bit to 1 if value >= threshold
+            bit_position = dim * num_bits_per_dim + bit_idx
+            encoded[:, bit_position] = (embeddings[:, dim] >= thresholds[dim, bit_idx]).astype(np.uint8)
+
+    # Note: bits num_thresholds to num_bits_per_dim-1 remain 0 (padding)
+    # For 7 thresholds, bits 0-6 are used, bit 7 is always 0
+
+    return encoded
+
+
 def numpy_binary_to_postgres_bit_string(binary_array: np.ndarray):
     """Convert numpy binary array to PostgreSQL bit string payload.
 
@@ -129,7 +185,7 @@ def ensure_connection():
 
 
 def table_exists_and_populated(
-    conn, table_name: str, expected_rows: int, check_mean_bin=False
+    conn, table_name: str, expected_rows: int, check_mean_bin=False, check_uint8_bin=False
 ):
     """Check if table exists and has the expected number of rows."""
     cursor = conn.cursor()
@@ -171,6 +227,21 @@ def table_exists_and_populated(
                 cursor.close()
                 return False
 
+        # Check for uint8-style binary column if required
+        if check_uint8_bin:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.columns
+                WHERE table_name = %s AND column_name = 'embedding_bin_uint8'
+                """,
+                (table_name,),
+            )
+            has_uint8_bin = cursor.fetchone()[0] > 0
+            if not has_uint8_bin:
+                cursor.close()
+                return False
+
         cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
         actual_rows = cursor.fetchone()[0]
         cursor.close()
@@ -188,10 +259,22 @@ def create_and_insert_table(
     precision: str,
     use_mean_binarization=False,
     dimension_means=None,
+    use_uint8_binarization=False,
+    uint8_thresholds=None,
 ):
     cursor = conn.cursor()
     cursor.execute(f"DROP TABLE IF EXISTS {name}")
     dim = embeddings.shape[1]
+    dim_uint8 = dim * 8  # 8 bits per dimension for uint8-style encoding
+
+    # Build optional columns
+    optional_cols = []
+    if use_mean_binarization:
+        optional_cols.append(f"embedding_bin_mean bit({dim})")
+    if use_uint8_binarization:
+        optional_cols.append(f"embedding_bin_uint8 bit({dim_uint8})")
+    optional_cols_str = (", " + ", ".join(optional_cols)) if optional_cols else ""
+
     if precision == "vector":
         # NEW: add stored/generated binary column
         cursor.execute(
@@ -200,7 +283,7 @@ def create_and_insert_table(
                 id BIGINT PRIMARY KEY,
                 embedding vector({dim}),
                 embedding_bin bit({dim}) GENERATED ALWAYS AS (binary_quantize(embedding)::bit({dim})) STORED
-                {", embedding_bin_mean bit(" + str(dim) + ")" if use_mean_binarization else ""}
+                {optional_cols_str}
             )
             """
         )
@@ -213,7 +296,7 @@ def create_and_insert_table(
                 id BIGINT PRIMARY KEY,
                 embedding halfvec({dim}),
                 embedding_bin bit({dim}) GENERATED ALWAYS AS (binary_quantize(embedding)::bit({dim})) STORED
-                {", embedding_bin_mean bit(" + str(dim) + ")" if use_mean_binarization else ""}
+                {optional_cols_str}
             )
             """
         )
@@ -224,47 +307,57 @@ def create_and_insert_table(
 
     ids = np.arange(embeddings.shape[0], dtype=np.int64)
 
-    # If mean binarization is enabled, compute binary vectors
+    # Precompute binary vectors if needed
+    binary_vecs_mean = None
+    binary_vecs_uint8 = None
+
     if use_mean_binarization and dimension_means is not None:
-        binary_vecs = binarize_with_means(embeddings[:, :dim], dimension_means[:dim])
+        binary_vecs_mean = binarize_with_means(embeddings[:, :dim], dimension_means[:dim])
+
+    if use_uint8_binarization and uint8_thresholds is not None:
+        binary_vecs_uint8 = encode_thermometer(embeddings[:, :dim], uint8_thresholds[:dim])
 
     for i in tqdm(
         range(0, embeddings.shape[0], BATCH_SIZE), desc=f"Insert {name}", unit="batch"
     ):
         batch_end = min(i + BATCH_SIZE, embeddings.shape[0])
-        if use_mean_binarization and dimension_means is not None:
-            batch_data = [
-                (
-                    int(ids[j]),
-                    embeddings[j][:dim]
-                    .astype(np.float16 if precision == "halfvec" else np.float32)
-                    .tolist(),
-                    numpy_binary_to_postgres_bit_string(binary_vecs[j]),
-                )
-                for j in range(i, batch_end)
+
+        # Build insert statement based on which binary columns are enabled
+        insert_cols = ["id", "embedding"]
+        if use_mean_binarization:
+            insert_cols.append("embedding_bin_mean")
+        if use_uint8_binarization:
+            insert_cols.append("embedding_bin_uint8")
+
+        # Build template values
+        template_parts = ["%s", f"%s{cast}"]
+        if use_mean_binarization:
+            template_parts.append(f"%s::bit({dim})")
+        if use_uint8_binarization:
+            template_parts.append(f"%s::bit({dim_uint8})")
+
+        # Build batch data
+        batch_data = []
+        for j in range(i, batch_end):
+            row = [
+                int(ids[j]),
+                embeddings[j][:dim]
+                .astype(np.float16 if precision == "halfvec" else np.float32)
+                .tolist(),
             ]
-            execute_values(
-                cursor,
-                f"INSERT INTO {name} (id, embedding, embedding_bin_mean) VALUES %s",
-                batch_data,
-                template=f"(%s, %s{cast}, %s::bit({dim}))",
-            )
-        else:
-            batch_data = [
-                (
-                    int(ids[j]),
-                    embeddings[j][:dim]
-                    .astype(np.float16 if precision == "halfvec" else np.float32)
-                    .tolist(),
-                )
-                for j in range(i, batch_end)
-            ]
-            execute_values(
-                cursor,
-                f"INSERT INTO {name} (id, embedding) VALUES %s",
-                batch_data,
-                template=f"(%s, %s{cast})",
-            )
+            if use_mean_binarization:
+                row.append(numpy_binary_to_postgres_bit_string(binary_vecs_mean[j]))
+            if use_uint8_binarization:
+                row.append(numpy_binary_to_postgres_bit_string(binary_vecs_uint8[j]))
+            batch_data.append(tuple(row))
+
+        execute_values(
+            cursor,
+            f"INSERT INTO {name} ({', '.join(insert_cols)}) VALUES %s",
+            batch_data,
+            template=f"({', '.join(template_parts)})",
+        )
+
         if (i // BATCH_SIZE) % 10 == 0:
             conn.commit()
     conn.commit()
@@ -272,12 +365,24 @@ def create_and_insert_table(
 
 
 def build_index(
-    conn, table: str, precision: str, kind: str, dim: int, use_mean_bin=False
+    conn, table: str, precision: str, kind: str, dim: int, use_mean_bin=False, use_uint8_bin=False
 ):
     cursor = conn.cursor()
     if kind == "binary_hnsw":
-        bin_col = "embedding_bin_mean" if use_mean_bin else "embedding_bin"
-        suffix = "_mean" if use_mean_bin else ""
+        # Choose binary column based on flags
+        if use_uint8_bin:
+            bin_col = "embedding_bin_uint8"
+            suffix = "_uint8"
+            bin_dim = dim * 8
+        elif use_mean_bin:
+            bin_col = "embedding_bin_mean"
+            suffix = "_mean"
+            bin_dim = dim
+        else:
+            bin_col = "embedding_bin"
+            suffix = ""
+            bin_dim = dim
+
         idx_name = f"idx_{table}_hnsw_bin{suffix}"
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
@@ -291,8 +396,20 @@ def build_index(
             conn.rollback()
             idx_name = None
     elif kind == "binary_ivf":
-        bin_col = "embedding_bin_mean" if use_mean_bin else "embedding_bin"
-        suffix = "_mean" if use_mean_bin else ""
+        # Choose binary column based on flags
+        if use_uint8_bin:
+            bin_col = "embedding_bin_uint8"
+            suffix = "_uint8"
+            bin_dim = dim * 8
+        elif use_mean_bin:
+            bin_col = "embedding_bin_mean"
+            suffix = "_mean"
+            bin_dim = dim
+        else:
+            bin_col = "embedding_bin"
+            suffix = ""
+            bin_dim = dim
+
         idx_name = f"idx_{table}_ivf_bin{suffix}"
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
@@ -360,6 +477,8 @@ def query_index(
     explain_analyze=False,
     use_mean_bin=False,
     dimension_means=None,
+    use_uint8_bin=False,
+    uint8_thresholds=None,
 ):
     cursor = conn.cursor()
     # Prepare query textual forms
@@ -372,6 +491,13 @@ def query_index(
             query_vec[:dim].reshape(1, -1), dimension_means[:dim]
         )[0]
         query_bin_mean_str = numpy_binary_to_postgres_bit_string(query_bin_mean)
+
+    # Prepare query binary representation for uint8-style binarization
+    if use_uint8_bin and uint8_thresholds is not None:
+        query_bin_uint8 = encode_thermometer(
+            query_vec[:dim].reshape(1, -1), uint8_thresholds[:dim]
+        )[0]
+        query_bin_uint8_str = numpy_binary_to_postgres_bit_string(query_bin_uint8)
 
     if kind == "ivf":
         # Set probes for IVFFlat
@@ -406,17 +532,56 @@ def query_index(
 
         cast_type = "vector" if precision == "vector" else "halfvec"
 
-        # Choose binary column and query based on mean binarization flag
-        if use_mean_bin:
+        # Choose binary column and query based on binarization flags (priority: uint8 > mean > default)
+        if use_uint8_bin:
+            bin_col = "embedding_bin_uint8"
+            query_bin_str = query_bin_uint8_str
+            bin_dim = dim * 8
+            bin_type = "uint8"
+            # One-shot candidate + rerank fully in SQL (using numpy-computed uint8 binary query)
+            sql = f"""
+            SELECT t.id
+            FROM (
+              SELECT id
+              FROM {table}
+              ORDER BY {bin_col} <~> %s::bit({bin_dim})
+              LIMIT {overfetch}
+            ) c
+            JOIN {table} t USING(id)
+            ORDER BY t.embedding <=> %s::{cast_type}
+            LIMIT {K}
+            """
+            # Warm-up
+            cursor.execute(sql, (query_bin_str, query_txt))
+            cursor.fetchall()
+
+            # Optional EXPLAIN ANALYZE for debugging
+            if explain_analyze:
+                print(
+                    f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}, uint8-bin):"
+                )
+                explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) " + sql
+                cursor.execute(explain_sql, (query_bin_str, query_txt))
+                for row in cursor.fetchall():
+                    print(row[0])
+                print()
+
+            start = time.time()
+            cursor.execute(sql, (query_bin_str, query_txt))
+            rows = cursor.fetchall()
+            retrieved = [int(r[0]) for r in rows]
+            latency = time.time() - start
+        elif use_mean_bin:
             bin_col = "embedding_bin_mean"
             query_bin_str = query_bin_mean_str
+            bin_dim = dim
             # One-shot candidate + rerank fully in SQL (using numpy-computed binary query)
             sql = f"""
             SELECT t.id
             FROM (
               SELECT id
               FROM {table}
-              ORDER BY {bin_col} <~> %s::bit({dim})
+              ORDER BY {bin_col} <~> %s::bit({bin_dim})
               LIMIT {overfetch}
             ) c
             JOIN {table} t USING(id)
@@ -480,7 +645,35 @@ def query_index(
         overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR
         cast_type = "vector" if precision == "vector" else "halfvec"
 
-        if use_mean_bin:
+        if use_uint8_bin:
+            bin_col = "embedding_bin_uint8"
+            query_bin_str = query_bin_uint8_str
+            bin_dim = dim * 8
+            if kind.endswith("_k"):
+                # Pure binary Hamming top-K without float rerank (uint8-based)
+                sql = f"""
+                SELECT id
+                FROM {table}
+                ORDER BY {bin_col} <~> %s::bit({bin_dim})
+                LIMIT {K}
+                """
+                params = (query_bin_str,)
+            else:
+                # Generate candidates by Hamming, then rerank by cosine in-db (uint8-based)
+                sql = f"""
+                SELECT t.id
+                FROM (
+                  SELECT id
+                  FROM {table}
+                  ORDER BY {bin_col} <~> %s::bit({bin_dim})
+                  LIMIT {overfetch}
+                ) c
+                JOIN {table} t USING(id)
+                ORDER BY t.embedding <=> %s::{cast_type}
+                LIMIT {K}
+                """
+                params = (query_bin_str, query_txt)
+        elif use_mean_bin:
             bin_col = "embedding_bin_mean"
             query_bin_str = query_bin_mean_str
             if kind.endswith("_k"):
@@ -560,7 +753,24 @@ def query_index(
         # Exact binary candidate generation with fixed 10x overfetch, SQL rerank in-db
         cast_type = "vector" if precision == "vector" else "halfvec"
 
-        if use_mean_bin:
+        if use_uint8_bin:
+            bin_col = "embedding_bin_uint8"
+            query_bin_str = query_bin_uint8_str
+            bin_dim = dim * 8
+            sql = f"""
+            SELECT t.id
+            FROM (
+              SELECT id
+              FROM {table}
+              ORDER BY {bin_col} <~> %s::bit({bin_dim})
+              LIMIT {K * 10}
+            ) c
+            JOIN {table} t USING(id)
+            ORDER BY t.embedding <=> %s::{cast_type}
+            LIMIT {K}
+            """
+            params = (query_bin_str, query_txt)
+        elif use_mean_bin:
             bin_col = "embedding_bin_mean"
             query_bin_str = query_bin_mean_str
             sql = f"""
@@ -798,6 +1008,11 @@ def main():
         action="store_true",
         help="Enable mean-based binarization (uses corpus-wide mean per dimension as threshold)",
     )
+    parser.add_argument(
+        "--enable-quasi-uint8",
+        action="store_true",
+        help="Enable quasi-uint8 binarization (8 buckets per dimension using percentile thresholds, thermometer encoding)",
+    )
 
     args = parser.parse_args()
 
@@ -929,6 +1144,16 @@ def main():
             f"[Setup] Mean range: [{dimension_means_1024.min():.6f}, {dimension_means_1024.max():.6f}]"
         )
 
+    # Compute percentile thresholds for quasi-uint8 binarization if enabled
+    uint8_thresholds_1024 = None
+    if args.enable_quasi_uint8:
+        print("[Setup] Computing percentile thresholds for quasi-uint8 binarization...")
+        uint8_thresholds_1024 = compute_percentile_thresholds(full_embeddings, num_buckets=8)
+        print(f"[Setup] Computed 7 thresholds per dimension (8 buckets) for all 1024 dimensions")
+        print(
+            f"[Setup] Threshold range: [{uint8_thresholds_1024.min():.6f}, {uint8_thresholds_1024.max():.6f}]"
+        )
+
     # Use a random vector from the dataset as the query (more realistic)
     print("[Setup] Selecting random query vector from dataset...")
     np.random.seed(999)
@@ -1011,10 +1236,14 @@ def main():
 
         # Check if tables already exist and are populated
         vec_exists = table_exists_and_populated(
-            conn, tbl_vector, num_vectors, check_mean_bin=args.enable_mean_binarization
+            conn, tbl_vector, num_vectors,
+            check_mean_bin=args.enable_mean_binarization,
+            check_uint8_bin=args.enable_quasi_uint8
         )
         half_exists = table_exists_and_populated(
-            conn, tbl_half, num_vectors, check_mean_bin=args.enable_mean_binarization
+            conn, tbl_half, num_vectors,
+            check_mean_bin=args.enable_mean_binarization,
+            check_uint8_bin=args.enable_quasi_uint8
         )
 
         if args.force_reload or not vec_exists:
@@ -1026,6 +1255,8 @@ def main():
                 "vector",
                 use_mean_binarization=args.enable_mean_binarization,
                 dimension_means=dimension_means_1024,
+                use_uint8_binarization=args.enable_quasi_uint8,
+                uint8_thresholds=uint8_thresholds_1024,
             )
         else:
             print(
@@ -1041,6 +1272,8 @@ def main():
                 "halfvec",
                 use_mean_binarization=args.enable_mean_binarization,
                 dimension_means=dimension_means_1024,
+                use_uint8_binarization=args.enable_quasi_uint8,
+                uint8_thresholds=uint8_thresholds_1024,
             )
         else:
             print(
@@ -1096,11 +1329,25 @@ def main():
             else:
                 idx_hnsw_bin_mean, t_hnsw_bin_mean = None, 0.0
                 idx_hnsw_bin_half_mean, t_hnsw_bin_half_mean = None, 0.0
+            if args.enable_quasi_uint8:
+                print("[Index] Building HNSW binary UINT8 (bit, float32 rerank) ...")
+                idx_hnsw_bin_uint8, t_hnsw_bin_uint8 = build_index(
+                    conn, tbl_vector, "vector", "binary_hnsw", dim, use_uint8_bin=True
+                )
+                print("[Index] Building HNSW binary UINT8 (bit, float16 rerank) ...")
+                idx_hnsw_bin_half_uint8, t_hnsw_bin_half_uint8 = build_index(
+                    conn, tbl_half, "halfvec", "binary_hnsw", dim, use_uint8_bin=True
+                )
+            else:
+                idx_hnsw_bin_uint8, t_hnsw_bin_uint8 = None, 0.0
+                idx_hnsw_bin_half_uint8, t_hnsw_bin_half_uint8 = None, 0.0
         else:
             idx_hnsw_bin, t_hnsw_bin = None, 0.0
             idx_hnsw_bin_half, t_hnsw_bin_half = None, 0.0
             idx_hnsw_bin_mean, t_hnsw_bin_mean = None, 0.0
             idx_hnsw_bin_half_mean, t_hnsw_bin_half_mean = None, 0.0
+            idx_hnsw_bin_uint8, t_hnsw_bin_uint8 = None, 0.0
+            idx_hnsw_bin_half_uint8, t_hnsw_bin_half_uint8 = None, 0.0
 
         # Binary IVFFlat indices
         if "binary-ivf" in benchmarks:
@@ -1132,11 +1379,29 @@ def main():
             else:
                 idx_ivf_bin_mean, t_ivf_bin_mean = None, 0.0
                 idx_ivf_bin_half_mean, t_ivf_bin_half_mean = None, 0.0
+            if args.enable_quasi_uint8:
+                print(
+                    f"[Index] Building IVFFlat binary UINT8 (bit, float32 rerank, lists={IVF_LISTS}) ..."
+                )
+                idx_ivf_bin_uint8, t_ivf_bin_uint8 = build_index(
+                    conn, tbl_vector, "vector", "binary_ivf", dim, use_uint8_bin=True
+                )
+                print(
+                    f"[Index] Building IVFFlat binary UINT8 (bit, float16 rerank, lists={IVF_LISTS}) ..."
+                )
+                idx_ivf_bin_half_uint8, t_ivf_bin_half_uint8 = build_index(
+                    conn, tbl_half, "halfvec", "binary_ivf", dim, use_uint8_bin=True
+                )
+            else:
+                idx_ivf_bin_uint8, t_ivf_bin_uint8 = None, 0.0
+                idx_ivf_bin_half_uint8, t_ivf_bin_half_uint8 = None, 0.0
         else:
             idx_ivf_bin, t_ivf_bin = None, 0.0
             idx_ivf_bin_half, t_ivf_bin_half = None, 0.0
             idx_ivf_bin_mean, t_ivf_bin_mean = None, 0.0
             idx_ivf_bin_half_mean, t_ivf_bin_half_mean = None, 0.0
+            idx_ivf_bin_uint8, t_ivf_bin_uint8 = None, 0.0
+            idx_ivf_bin_half_uint8, t_ivf_bin_half_uint8 = None, 0.0
 
         # Query each (conditionally based on selected benchmarks)
         # Enable explain_analyze only for 512-D queries
@@ -1239,6 +1504,43 @@ def main():
                     conn, idx_hnsw_bin_half_mean
                 )
 
+            if args.enable_quasi_uint8:
+                print(
+                    f"[Query] HNSW binary UINT8 float32 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_hnsw_bin_uint8, rec_hnsw_bin_uint8 = query_index(
+                    conn,
+                    tbl_vector,
+                    "vector",
+                    "binary_hnsw",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_uint8_bin=True,
+                    uint8_thresholds=uint8_thresholds_1024,
+                )
+                size_hnsw_bin_uint8 = get_index_size_mb(conn, idx_hnsw_bin_uint8)
+
+                print(
+                    f"[Query] HNSW binary UINT8 float16 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_hnsw_bin_half_uint8, rec_hnsw_bin_half_uint8 = query_index(
+                    conn,
+                    tbl_half,
+                    "halfvec",
+                    "binary_hnsw",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_uint8_bin=True,
+                    uint8_thresholds=uint8_thresholds_1024,
+                )
+                size_hnsw_bin_half_uint8 = get_index_size_mb(
+                    conn, idx_hnsw_bin_half_uint8
+                )
+
         # Binary IVFFlat queries
         if "binary-ivf" in benchmarks:
             print(
@@ -1305,6 +1607,41 @@ def main():
                     dimension_means=dimension_means_1024,
                 )
                 size_ivf_bin_half_mean = get_index_size_mb(conn, idx_ivf_bin_half_mean)
+
+            if args.enable_quasi_uint8:
+                print(
+                    f"[Query] IVFFlat binary UINT8 float32 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_ivf_bin_uint8, rec_ivf_bin_uint8 = query_index(
+                    conn,
+                    tbl_vector,
+                    "vector",
+                    "binary_ivf",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_uint8_bin=True,
+                    uint8_thresholds=uint8_thresholds_1024,
+                )
+                size_ivf_bin_uint8 = get_index_size_mb(conn, idx_ivf_bin_uint8)
+
+                print(
+                    f"[Query] IVFFlat binary UINT8 float16 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+                )
+                lat_ivf_bin_half_uint8, rec_ivf_bin_half_uint8 = query_index(
+                    conn,
+                    tbl_half,
+                    "halfvec",
+                    "binary_ivf",
+                    dim,
+                    query_trunc,
+                    baseline_ids,
+                    explain_analyze=do_explain,
+                    use_uint8_bin=True,
+                    uint8_thresholds=uint8_thresholds_1024,
+                )
+                size_ivf_bin_half_uint8 = get_index_size_mb(conn, idx_ivf_bin_half_uint8)
 
         # Binary exact queries
         if "binary-exact" in benchmarks:
@@ -1544,6 +1881,32 @@ def main():
                     }
                 )
 
+            if args.enable_quasi_uint8:
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float32",
+                        "index": f"hnsw+binary-uint8(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_hnsw_bin_uint8 * 1000,
+                        "recall": rec_hnsw_bin_uint8,
+                        "build_s": t_hnsw_bin_uint8,
+                        "index_mb": size_hnsw_bin_uint8,
+                        "storage_mb": storage_vec_mb,
+                    }
+                )
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float16",
+                        "index": f"hnsw+binary-uint8(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_hnsw_bin_half_uint8 * 1000,
+                        "recall": rec_hnsw_bin_half_uint8,
+                        "build_s": t_hnsw_bin_half_uint8,
+                        "index_mb": size_hnsw_bin_half_uint8,
+                        "storage_mb": storage_half_mb,
+                    }
+                )
+
         if "binary-ivf" in benchmarks:
             results.append(
                 {
@@ -1592,6 +1955,32 @@ def main():
                         "recall": rec_ivf_bin_half_mean,
                         "build_s": t_ivf_bin_half_mean,
                         "index_mb": size_ivf_bin_half_mean,
+                        "storage_mb": storage_half_mb,
+                    }
+                )
+
+            if args.enable_quasi_uint8:
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float32",
+                        "index": f"ivf+binary-uint8(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_ivf_bin_uint8 * 1000,
+                        "recall": rec_ivf_bin_uint8,
+                        "build_s": t_ivf_bin_uint8,
+                        "index_mb": size_ivf_bin_uint8,
+                        "storage_mb": storage_vec_mb,
+                    }
+                )
+                results.append(
+                    {
+                        "dim": dim,
+                        "storage": "float16",
+                        "index": f"ivf+binary-uint8(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                        "lat_ms": lat_ivf_bin_half_uint8 * 1000,
+                        "recall": rec_ivf_bin_half_uint8,
+                        "build_s": t_ivf_bin_half_uint8,
+                        "index_mb": size_ivf_bin_half_uint8,
                         "storage_mb": storage_half_mb,
                     }
                 )
