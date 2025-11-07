@@ -1,13 +1,9 @@
-# Implement retrieval benchmark (implemented in retrieval_benchmark.py)
+# Implement adaptive binary quantization (in retrieval_benchmark.py)
 
-The goal of this benchmark to compare different vector storage and index configurations of JINA CLIP v2 text embeddings - to find a configuration that maximizes recall and minimizes storage and retrieval times.
+Exploit information increase along vector dim of matryoshka embeddings: represent first dims with more bits than last dims:
+- 0 - 128 dims: 128x16=2048bits - quasi uint16 binary mean threshold quantisation
+- 128 - 256 dims: 128x8=1024bits - quasi uint8 binary mean threshold quantisation
+- 256 - 512 dims: 256x4=1024bits - quasi uint4 binary mean threshold quantisation
+- 512 - 1024 dims: 512x2=1024bits - binary mean threshold quantisation
 
-Eval following knobs (vs bruteforce baseline via recall):
-- Matryoshka dimensions (vector storage dimensions): 128, 512, 768, 1024
-- Storage float precision (halfvector float16)
-
-`CREATE TABLE items (id bigserial PRIMARY KEY, embedding halfvec(1024));`
-
-- Index precision (full,  halfvector, binary with overfetching: fetch 10X results, then compute real distance)
-
-`CREATE INDEX ON items USING hnsw ((embedding::bit(1024)) bit_cosine_ops);`
+Total vector size: 5120bits
