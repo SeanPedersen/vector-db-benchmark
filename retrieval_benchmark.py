@@ -195,6 +195,7 @@ def query_index(
     query_vec: np.ndarray,
     baseline_ids,
     debug=False,
+    local_embeddings=None,  # New: optional local embeddings for NumPy rerank
 ):
     cursor = conn.cursor()
     # Prepare query textual forms
@@ -331,6 +332,55 @@ def query_index(
                 cursor.execute("SET enable_seqscan = on")
             except Exception:
                 pass
+    elif kind in ("binary_hnsw_numpy", "binary_ivf_numpy"):
+        # Overfetch via Hamming using the binary index, then NumPy rerank by cosine
+        if local_embeddings is None:
+            raise ValueError("local_embeddings must be provided for NumPy rerank")
+        overfetch = K * OVERFETCH_FACTOR
+
+        # Configure planner for the candidate fetch phase
+        if kind == "binary_ivf_numpy":
+            cursor.execute(f"SET ivfflat.probes = {IVF_PROBES_BINARY}")
+        else:
+            cursor.execute(f"SET hnsw.ef_search = {HNSW_EF_SEARCH}")
+
+        # Candidate fetch SQL (only ids)
+        candidate_sql = f"""
+        SELECT id
+        FROM {table}
+        ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
+        LIMIT {overfetch}
+        """
+
+        # Warm-up: candidate fetch + NumPy rerank
+        cursor.execute(candidate_sql, (query_txt,))
+        warm_ids = [r[0] for r in cursor.fetchall()]
+        if warm_ids:
+            dtype = np.float16 if precision == "halfvec" else np.float32
+            q = query_vec.astype(dtype, copy=False)
+            cands = local_embeddings[np.array(warm_ids, dtype=np.int64)]
+            cands = cands.astype(dtype, copy=False)
+            _ = cands @ q  # warm up matmul
+
+        # Timed: candidate fetch + NumPy rerank
+        start = time.time()
+        cursor.execute(candidate_sql, (query_txt,))
+        ids = [r[0] for r in cursor.fetchall()]
+
+        if ids:
+            dtype = np.float16 if precision == "halfvec" else np.float32
+            q = query_vec.astype(dtype, copy=False)
+            cands = local_embeddings[np.array(ids, dtype=np.int64)]
+            cands = cands.astype(dtype, copy=False)
+            sims = cands @ q  # cosine similarity since inputs are normalized
+            n = min(K, sims.shape[0])
+            top_idx = np.argpartition(-sims, n - 1)[:n]
+            order = np.argsort(-sims[top_idx])
+            retrieved = [int(ids[i]) for i in top_idx[order]]
+        else:
+            retrieved = []
+
+        latency = time.time() - start
     else:
         # Warm-up
         cast_type = "vector" if precision == "vector" else "halfvec"
@@ -657,6 +707,61 @@ def main():
         )
         size_ivf_bin_half = get_index_size_mb(conn, idx_ivf_bin_half)
 
+        # New: NumPy rerank variants for binary overfetch
+        print(
+            f"[Query] HNSW binary NumPy rerank float32 (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_hnsw_bin_np, rec_hnsw_bin_np = query_index(
+            conn,
+            tbl_vector,
+            "vector",
+            "binary_hnsw_numpy",
+            dim,
+            query_trunc,
+            baseline_ids,
+            local_embeddings=trunc_embeddings,
+        )
+        print(
+            f"[Query] HNSW binary NumPy rerank float16 (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_hnsw_bin_np_half, rec_hnsw_bin_np_half = query_index(
+            conn,
+            tbl_half,
+            "halfvec",
+            "binary_hnsw_numpy",
+            dim,
+            query_trunc,
+            baseline_ids,
+            local_embeddings=trunc_embeddings,
+        )
+
+        print(
+            f"[Query] IVFFlat binary NumPy rerank float32 (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_ivf_bin_np, rec_ivf_bin_np = query_index(
+            conn,
+            tbl_vector,
+            "vector",
+            "binary_ivf_numpy",
+            dim,
+            query_trunc,
+            baseline_ids,
+            local_embeddings=trunc_embeddings,
+        )
+        print(
+            f"[Query] IVFFlat binary NumPy rerank float16 (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_ivf_bin_np_half, rec_ivf_bin_np_half = query_index(
+            conn,
+            tbl_half,
+            "halfvec",
+            "binary_ivf_numpy",
+            dim,
+            query_trunc,
+            baseline_ids,
+            local_embeddings=trunc_embeddings,
+        )
+
         # Exact binary (no binary index) + rerank
         print(f"[Query] Exact binary float32 rerank ({OVERFETCH_FACTOR}x overfetch)...")
         lat_bin_exact_vec, rec_bin_exact_vec = query_index(
@@ -667,7 +772,7 @@ def main():
             conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids
         )
 
-        # New: exact retrieval (sequential scan, no index)
+        # New: exact retrieval (sequential, no index)
         print("[Query] Exact float32 (sequential, no index)...")
         lat_exact_vec, rec_exact_vec = query_index(
             conn, tbl_vector, "vector", "exact", dim, query_trunc, baseline_ids
@@ -801,6 +906,46 @@ def main():
                     "recall": rec_exact_half,
                     "build_s": 0.0,
                     "index_mb": 0.0,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"hnsw+binary+numpy(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin_np * 1000,
+                    "recall": rec_hnsw_bin_np,
+                    "build_s": t_hnsw_bin,
+                    "index_mb": size_hnsw_bin,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"hnsw+binary+numpy(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin_np_half * 1000,
+                    "recall": rec_hnsw_bin_np_half,
+                    "build_s": t_hnsw_bin_half,
+                    "index_mb": size_hnsw_bin_half,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"ivf+binary+numpy(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin_np * 1000,
+                    "recall": rec_ivf_bin_np,
+                    "build_s": t_ivf_bin,
+                    "index_mb": size_ivf_bin,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"ivf+binary+numpy(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin_np_half * 1000,
+                    "recall": rec_ivf_bin_np_half,
+                    "build_s": t_ivf_bin_half,
+                    "index_mb": size_ivf_bin_half,
                     "storage_mb": storage_half_mb,
                 },
             ]
