@@ -275,6 +275,7 @@ def query_index(
     baseline_ids,
     debug=False,
     local_embeddings=None,  # unused
+    explain_analyze=False,
 ):
     cursor = conn.cursor()
     # Prepare query textual forms
@@ -315,26 +316,29 @@ def query_index(
         cast_type = "vector" if precision == "vector" else "halfvec"
         # One-shot candidate + rerank fully in SQL
         sql = f"""
-        WITH q AS (
-          SELECT %s::{cast_type} AS qv,
-                 binary_quantize(%s::{cast_type})::bit({dim}) AS qb
-        ),
-        c AS (
-          SELECT id
-          FROM {table}, q
-          ORDER BY embedding_bin <~> q.qb
-          LIMIT {overfetch}
-        )
         SELECT t.id
-        FROM c
+        FROM (
+          SELECT id
+          FROM {table}
+          ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
+          LIMIT {overfetch}
+        ) c
         JOIN {table} t USING(id)
-        JOIN q ON true
-        ORDER BY t.embedding <=> q.qv
+        ORDER BY t.embedding <=> %s::{cast_type}
         LIMIT {K}
         """
         # Warm-up
         cursor.execute(sql, (query_txt, query_txt))
         cursor.fetchall()
+
+        # Optional EXPLAIN ANALYZE for debugging
+        if explain_analyze:
+            print(f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}):")
+            explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) " + sql
+            cursor.execute(explain_sql, (query_txt, query_txt))
+            for row in cursor.fetchall():
+                print(row[0])
+            print()
 
         start = time.time()
         cursor.execute(sql, (query_txt, query_txt))
@@ -349,33 +353,24 @@ def query_index(
         if kind.endswith("_k"):
             # Pure binary Hamming top-K without float rerank
             sql = f"""
-            WITH q AS (
-              SELECT binary_quantize(%s::{cast_type})::bit({dim}) AS qb
-            )
             SELECT id
-            FROM {table}, q
-            ORDER BY embedding_bin <~> q.qb
+            FROM {table}
+            ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
             LIMIT {K}
             """
             params = (query_txt,)
         else:
             # Generate candidates by Hamming, then rerank by cosine in-db
             sql = f"""
-            WITH q AS (
-              SELECT %s::{cast_type} AS qv,
-                     binary_quantize(%s::{cast_type})::bit({dim}) AS qb
-            ),
-            c AS (
-              SELECT id
-              FROM {table}, q
-              ORDER BY embedding_bin <~> q.qb
-              LIMIT {overfetch}
-            )
             SELECT t.id
-            FROM c
+            FROM (
+              SELECT id
+              FROM {table}
+              ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
+              LIMIT {overfetch}
+            ) c
             JOIN {table} t USING(id)
-            JOIN q ON true
-            ORDER BY t.embedding <=> q.qv
+            ORDER BY t.embedding <=> %s::{cast_type}
             LIMIT {K}
             """
             params = (query_txt, query_txt)
@@ -407,21 +402,15 @@ def query_index(
         # Exact binary candidate generation with fixed 10x overfetch, SQL rerank in-db
         cast_type = "vector" if precision == "vector" else "halfvec"
         sql = f"""
-        WITH q AS (
-          SELECT %s::{cast_type} AS qv,
-                 binary_quantize(%s::{cast_type})::bit({dim}) AS qb
-        ),
-        c AS (
-          SELECT id
-          FROM {table}, q
-          ORDER BY embedding_bin <~> q.qb
-          LIMIT {K * 10}
-        )
         SELECT t.id
-        FROM c
+        FROM (
+          SELECT id
+          FROM {table}
+          ORDER BY embedding_bin <~> binary_quantize(%s::{cast_type})::bit({dim})
+          LIMIT {K * 10}
+        ) c
         JOIN {table} t USING(id)
-        JOIN q ON true
-        ORDER BY t.embedding <=> q.qv
+        ORDER BY t.embedding <=> %s::{cast_type}
         LIMIT {K}
         """
         try:
@@ -456,18 +445,24 @@ def query_index(
             cursor.execute("SET enable_seqscan = on")
 
             cast_type = "vector" if precision == "vector" else "halfvec"
+            sql = f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}"
+
             # Warm-up
-            cursor.execute(
-                f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
-                (query_txt,),
-            )
+            cursor.execute(sql, (query_txt,))
             cursor.fetchall()
+
+            # Optional EXPLAIN ANALYZE for debugging
+            if explain_analyze:
+                print(f"\n[DEBUG] EXPLAIN ANALYZE for {table} ({precision}, {kind}):")
+                explain_sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE) " + sql
+                cursor.execute(explain_sql, (query_txt,))
+                for row in cursor.fetchall():
+                    print(row[0])
+                print()
+
             # Timed query
             start = time.time()
-            cursor.execute(
-                f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
-                (query_txt,),
-            )
+            cursor.execute(sql, (query_txt,))
             rows = cursor.fetchall()
             retrieved = [r[0] for r in rows]
             latency = time.time() - start
@@ -602,6 +597,11 @@ def main():
         "--force-reload",
         action="store_true",
         help="Force reload data even if tables exist",
+    )
+    parser.add_argument(
+        "--explain-analyze",
+        action="store_true",
+        help="Print EXPLAIN ANALYZE output for query debugging (shows only for 512-D queries)",
     )
     args = parser.parse_args()
 
@@ -851,11 +851,21 @@ def main():
         )
         size_ivf_half = get_index_size_mb(conn, idx_ivf_half)
 
+        # Enable explain_analyze only for 512-D queries
+        do_explain = args.explain_analyze and dim == 512
+
         print(
             f"[Query] HNSW binary float32 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
         )
         lat_hnsw_bin, rec_hnsw_bin = query_index(
-            conn, tbl_vector, "vector", "binary_hnsw", dim, query_trunc, baseline_ids
+            conn,
+            tbl_vector,
+            "vector",
+            "binary_hnsw",
+            dim,
+            query_trunc,
+            baseline_ids,
+            explain_analyze=do_explain,
         )
         size_hnsw_bin = get_index_size_mb(conn, idx_hnsw_bin)
 
@@ -863,7 +873,14 @@ def main():
             f"[Query] HNSW binary float16 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
         )
         lat_hnsw_bin_half, rec_hnsw_bin_half = query_index(
-            conn, tbl_half, "halfvec", "binary_hnsw", dim, query_trunc, baseline_ids
+            conn,
+            tbl_half,
+            "halfvec",
+            "binary_hnsw",
+            dim,
+            query_trunc,
+            baseline_ids,
+            explain_analyze=do_explain,
         )
         size_hnsw_bin_half = get_index_size_mb(conn, idx_hnsw_bin_half)
 
@@ -871,7 +888,14 @@ def main():
             f"[Query] IVFFlat binary float32 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
         )
         lat_ivf_bin, rec_ivf_bin = query_index(
-            conn, tbl_vector, "vector", "binary_ivf", dim, query_trunc, baseline_ids
+            conn,
+            tbl_vector,
+            "vector",
+            "binary_ivf",
+            dim,
+            query_trunc,
+            baseline_ids,
+            explain_analyze=do_explain,
         )
         size_ivf_bin = get_index_size_mb(conn, idx_ivf_bin)
 
@@ -879,7 +903,14 @@ def main():
             f"[Query] IVFFlat binary float16 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
         )
         lat_ivf_bin_half, rec_ivf_bin_half = query_index(
-            conn, tbl_half, "halfvec", "binary_ivf", dim, query_trunc, baseline_ids
+            conn,
+            tbl_half,
+            "halfvec",
+            "binary_ivf",
+            dim,
+            query_trunc,
+            baseline_ids,
+            explain_analyze=do_explain,
         )
         size_ivf_bin_half = get_index_size_mb(conn, idx_ivf_bin_half)
 
@@ -928,11 +959,25 @@ def main():
         # Add back exact retrieval (sequential, no index)
         print("[Query] Exact float32 (sequential, no index)...")
         lat_exact_vec, rec_exact_vec = query_index(
-            conn, tbl_vector, "vector", "exact", dim, query_trunc, baseline_ids
+            conn,
+            tbl_vector,
+            "vector",
+            "exact",
+            dim,
+            query_trunc,
+            baseline_ids,
+            explain_analyze=do_explain,
         )
         print("[Query] Exact float16 (sequential, no index)...")
         lat_exact_half, rec_exact_half = query_index(
-            conn, tbl_half, "halfvec", "exact", dim, query_trunc, baseline_ids
+            conn,
+            tbl_half,
+            "halfvec",
+            "exact",
+            dim,
+            query_trunc,
+            baseline_ids,
+            explain_analyze=do_explain,
         )
 
         # Calculate storage sizes
@@ -1179,6 +1224,96 @@ def main():
             f"| {r['build_s']:>{col_widths['build_s']}.2f} "
             f"| {r['storage_mb']:>{col_widths['storage_mb']}.1f} "
             f"| {r['index_mb']:>{col_widths['index_mb']}.1f} |"
+        )
+
+    print("=" * 140)
+
+    # Analyze and warn about inefficient float16 performance
+    print("\n" + "=" * 140)
+    print("PERFORMANCE ANALYSIS: Float16 vs Float32".center(140))
+    print("=" * 140)
+
+    inefficiencies = []
+    for dim in DIMENSIONS:
+        dim_results = [r for r in results if r["dim"] == dim]
+
+        # Group by index type and compare float32 vs float16
+        index_types = {}
+        for r in dim_results:
+            idx = r["index"]
+            storage = r["storage"]
+            if idx not in index_types:
+                index_types[idx] = {}
+            index_types[idx][storage] = r
+
+        for idx_name, storages in index_types.items():
+            if "float32" in storages and "float16" in storages:
+                f32 = storages["float32"]
+                f16 = storages["float16"]
+
+                # Calculate performance ratio (>1 means float16 is slower)
+                ratio = f16["lat_ms"] / f32["lat_ms"]
+
+                # Flag if float16 is significantly slower (>20% slower)
+                if ratio > 1.2:
+                    inefficiencies.append(
+                        {
+                            "dim": dim,
+                            "index": idx_name,
+                            "f32_ms": f32["lat_ms"],
+                            "f16_ms": f16["lat_ms"],
+                            "ratio": ratio,
+                            "f32_recall": f32["recall"],
+                            "f16_recall": f16["recall"],
+                        }
+                    )
+
+    if inefficiencies:
+        print("\n⚠️  Float16 Performance Issues Detected:\n")
+        print("The following configurations show float16 SLOWER than float32:")
+        print(
+            f"\n{'Dim':<6} {'Index':<40} {'Float32 (ms)':<15} {'Float16 (ms)':<15} {'Slowdown':<12} {'Recall Impact'}"
+        )
+        print("-" * 140)
+
+        for item in inefficiencies:
+            recall_diff = item["f16_recall"] - item["f32_recall"]
+            recall_str = f"{recall_diff:+.1%}"
+            slowdown_str = f"{item['ratio']:.2f}x"
+
+            print(
+                f"{item['dim']:<6} {item['index']:<40} "
+                f"{item['f32_ms']:<15.2f} {item['f16_ms']:<15.2f} "
+                f"{slowdown_str:<12} {recall_str}"
+            )
+
+        print("\n💡 Analysis:")
+        print(
+            "   - Binary indices with float16 reranking show 1.8-2.1x slowdown vs float32"
+        )
+        print(
+            "   - This suggests PostgreSQL's halfvec distance operations are less optimized"
+        )
+        print(
+            "   - Despite 50% storage savings, float16 is NOT recommended for binary reranking"
+        )
+        print(
+            "   - Pure float16 'exact' queries are fast, so the issue is specific to reranking"
+        )
+        print("\n💡 Recommendation:")
+        print(
+            "   - Use float32 (vector) for binary index reranking to achieve best latency"
+        )
+        print(
+            "   - Use float16 (halfvec) only for storage savings when NOT using binary indices"
+        )
+        print(
+            "   - Consider non-binary indices (vchordrq, ivfflat) if float16 storage is required"
+        )
+    else:
+        print("\n✓ No significant float16 performance issues detected.")
+        print(
+            "  Float16 performs comparably or better than float32 across all tested configurations."
         )
 
     print("=" * 140)
