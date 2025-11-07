@@ -299,6 +299,38 @@ def query_index(
                 cursor.execute("SET enable_seqscan = on")
             except Exception:
                 pass
+    elif kind == "exact":
+        # Exact retrieval via sequential scan (no index usage)
+        try:
+            cursor.execute("SET enable_indexscan = off")
+            cursor.execute("SET enable_bitmapscan = off")
+            cursor.execute("SET enable_indexonlyscan = off")
+            cursor.execute("SET enable_seqscan = on")
+
+            cast_type = "vector" if precision == "vector" else "halfvec"
+            # Warm-up
+            cursor.execute(
+                f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+                (query_txt,),
+            )
+            cursor.fetchall()
+            # Timed query
+            start = time.time()
+            cursor.execute(
+                f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+                (query_txt,),
+            )
+            rows = cursor.fetchall()
+            retrieved = [r[0] for r in rows]
+            latency = time.time() - start
+        finally:
+            try:
+                cursor.execute("SET enable_indexscan = on")
+                cursor.execute("SET enable_bitmapscan = on")
+                cursor.execute("SET enable_indexonlyscan = on")
+                cursor.execute("SET enable_seqscan = on")
+            except Exception:
+                pass
     else:
         # Warm-up
         cast_type = "vector" if precision == "vector" else "halfvec"
@@ -625,7 +657,7 @@ def main():
         )
         size_ivf_bin_half = get_index_size_mb(conn, idx_ivf_bin_half)
 
-        # New: exact binary (no binary index) + rerank
+        # Exact binary (no binary index) + rerank
         print(f"[Query] Exact binary float32 rerank ({OVERFETCH_FACTOR}x overfetch)...")
         lat_bin_exact_vec, rec_bin_exact_vec = query_index(
             conn, tbl_vector, "vector", "binary_exact", dim, query_trunc, baseline_ids
@@ -633,6 +665,16 @@ def main():
         print(f"[Query] Exact binary float16 rerank ({OVERFETCH_FACTOR}x overfetch)...")
         lat_bin_exact_half, rec_bin_exact_half = query_index(
             conn, tbl_half, "halfvec", "binary_exact", dim, query_trunc, baseline_ids
+        )
+
+        # New: exact retrieval (sequential scan, no index)
+        print("[Query] Exact float32 (sequential, no index)...")
+        lat_exact_vec, rec_exact_vec = query_index(
+            conn, tbl_vector, "vector", "exact", dim, query_trunc, baseline_ids
+        )
+        print("[Query] Exact float16 (sequential, no index)...")
+        lat_exact_half, rec_exact_half = query_index(
+            conn, tbl_half, "halfvec", "exact", dim, query_trunc, baseline_ids
         )
 
         # Calculate storage sizes
@@ -737,6 +779,26 @@ def main():
                     "index": f"exact-binary({OVERFETCH_FACTOR}x)",
                     "lat_ms": lat_bin_exact_half * 1000,
                     "recall": rec_bin_exact_half,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": "exact",
+                    "lat_ms": lat_exact_vec * 1000,
+                    "recall": rec_exact_vec,
+                    "build_s": 0.0,
+                    "index_mb": 0.0,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": "exact",
+                    "lat_ms": lat_exact_half * 1000,
+                    "recall": rec_exact_half,
                     "build_s": 0.0,
                     "index_mb": 0.0,
                     "storage_mb": storage_half_mb,
