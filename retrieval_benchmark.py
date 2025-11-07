@@ -83,6 +83,20 @@ def table_exists_and_populated(conn, table_name: str, expected_rows: int):
             cursor.close()
             return False
 
+        # NEW: ensure the binary column exists so we don't skip recreation
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_name = %s AND column_name = 'embedding_bin'
+            """,
+            (table_name,),
+        )
+        has_bin = cursor.fetchone()[0] > 0
+        if not has_bin:
+            cursor.close()
+            return False
+
         cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
         actual_rows = cursor.fetchone()[0]
         cursor.close()
@@ -98,13 +112,27 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
     cursor.execute(f"DROP TABLE IF EXISTS {name}")
     dim = embeddings.shape[1]
     if precision == "vector":
+        # NEW: add stored/generated binary column
         cursor.execute(
-            f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, embedding vector({dim}))"
+            f"""
+            CREATE TABLE {name} (
+                id BIGINT PRIMARY KEY,
+                embedding vector({dim}),
+                embedding_bin bit({dim}) GENERATED ALWAYS AS (binary_quantize(embedding)::bit({dim})) STORED
+            )
+            """
         )
         cast = "::vector"
     elif precision == "halfvec":
+        # NEW: add stored/generated binary column
         cursor.execute(
-            f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, embedding halfvec({dim}))"
+            f"""
+            CREATE TABLE {name} (
+                id BIGINT PRIMARY KEY,
+                embedding halfvec({dim}),
+                embedding_bin bit({dim}) GENERATED ALWAYS AS (binary_quantize(embedding)::bit({dim})) STORED
+            )
+            """
         )
         cast = "::halfvec"
     else:
@@ -145,10 +173,9 @@ def build_index(conn, table: str, precision: str, kind: str, dim: int):
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
         try:
-            # Use pgvector's HNSW with binary_quantize for binary quantization
-            # Use bit_hamming_ops for Hamming distance
+            # NEW: index the stored binary column directly
             cursor.execute(
-                f"CREATE INDEX {idx_name} ON {table} USING hnsw ((binary_quantize(embedding)::bit({dim})) bit_hamming_ops)"
+                f"CREATE INDEX {idx_name} ON {table} USING hnsw (embedding_bin bit_hamming_ops)"
             )
         except Exception:
             conn.rollback()
@@ -158,10 +185,9 @@ def build_index(conn, table: str, precision: str, kind: str, dim: int):
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
         try:
-            # Use pgvector's IVFFlat with binary_quantize for binary quantization
-            # Use bit_hamming_ops for Hamming distance
+            # NEW: index the stored binary column directly
             cursor.execute(
-                f"CREATE INDEX {idx_name} ON {table} USING ivfflat ((binary_quantize(embedding)::bit({dim})) bit_hamming_ops) WITH (lists = {IVF_LISTS})"
+                f"CREATE INDEX {idx_name} ON {table} USING ivfflat (embedding_bin bit_hamming_ops) WITH (lists = {IVF_LISTS})"
             )
         except Exception:
             conn.rollback()
@@ -248,24 +274,21 @@ def query_index(
         "binary_ivf",
         "binary_hnsw_numpy",
         "binary_ivf_numpy",
-        # NEW no-overfetch kinds
         "binary_hnsw_k",
         "binary_ivf_k",
     ):
-        # Binary overfetch via index, then NumPy cosine rerank on stored embeddings
-        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR  # NEW
+        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR
 
-        # Configure index search params
         if "ivf" in kind:
             cursor.execute(f"SET ivfflat.probes = {IVF_PROBES_BINARY}")
         else:
             cursor.execute(f"SET hnsw.ef_search = {HNSW_EF_SEARCH}")
 
-        # Candidate ids only
+        # NEW: use stored binary column on the left-hand side
         cand_sql = f"""
         SELECT id
         FROM {table}
-        ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
+        ORDER BY embedding_bin <~> binary_quantize(%s::{precision})::bit({dim})
         LIMIT {overfetch}
         """
         # Warm-up
@@ -304,19 +327,19 @@ def query_index(
             retrieved = []
 
         latency = time.time() - start
-    elif kind in ("binary_exact", "binary_exact_k"):  # NEW: _k variant
-        # Exact binary overfetch (seq scan); NumPy cosine rerank
-        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR  # NEW
+    elif kind in ("binary_exact", "binary_exact_k"):
+        overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR
         try:
             cursor.execute("SET enable_indexscan = off")
             cursor.execute("SET enable_bitmapscan = off")
             cursor.execute("SET enable_indexonlyscan = off")
             cursor.execute("SET enable_seqscan = on")
 
+            # NEW: use stored binary column on the left-hand side
             cand_sql = f"""
             SELECT id
             FROM {table}
-            ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim})
+            ORDER BY embedding_bin <~> binary_quantize(%s::{precision})::bit({dim})
             LIMIT {overfetch}
             """
             # Warm-up
