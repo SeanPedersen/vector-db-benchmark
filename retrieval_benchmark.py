@@ -342,27 +342,44 @@ def query_index(
         retrieved = [int(r[0]) for r in rows]
         latency = time.time() - start
     elif kind in ("binary_exact", "binary_exact_k"):
-        # Exact binary candidate generation with SQL rerank in-db
+        # Exact binary candidate generation (no index). For _k: no rerank to measure pure Hamming scan speed.
         overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR
         cast_type = "vector" if precision == "vector" else "halfvec"
-        sql = f"""
-        WITH q AS (
-          SELECT %s::{cast_type} AS qv,
-                 binary_quantize(%s::{cast_type})::bit({dim}) AS qb
-        ),
-        c AS (
-          SELECT id
-          FROM {table}, q
-          ORDER BY embedding_bin <~> q.qb
-          LIMIT {overfetch}
-        )
-        SELECT t.id
-        FROM c
-        JOIN {table} t USING(id)
-        JOIN q ON true
-        ORDER BY t.embedding <=> q.qv
-        LIMIT {K}
-        """
+
+        if kind.endswith("_k"):
+            # Pure binary Hamming top-K without float rerank
+            sql = f"""
+            WITH q AS (
+              SELECT binary_quantize(%s::{cast_type})::bit({dim}) AS qb
+            )
+            SELECT id
+            FROM {table}, q
+            ORDER BY embedding_bin <~> q.qb
+            LIMIT {K}
+            """
+            params = (query_txt,)
+        else:
+            # Generate candidates by Hamming, then rerank by cosine in-db
+            sql = f"""
+            WITH q AS (
+              SELECT %s::{cast_type} AS qv,
+                     binary_quantize(%s::{cast_type})::bit({dim}) AS qb
+            ),
+            c AS (
+              SELECT id
+              FROM {table}, q
+              ORDER BY embedding_bin <~> q.qb
+              LIMIT {overfetch}
+            )
+            SELECT t.id
+            FROM c
+            JOIN {table} t USING(id)
+            JOIN q ON true
+            ORDER BY t.embedding <=> q.qv
+            LIMIT {K}
+            """
+            params = (query_txt, query_txt)
+
         try:
             cursor.execute("SET enable_indexscan = off")
             cursor.execute("SET enable_bitmapscan = off")
@@ -370,11 +387,11 @@ def query_index(
             cursor.execute("SET enable_seqscan = on")
 
             # Warm-up
-            cursor.execute(sql, (query_txt, query_txt))
+            cursor.execute(sql, params)
             cursor.fetchall()
 
             start = time.time()
-            cursor.execute(sql, (query_txt, query_txt))
+            cursor.execute(sql, params)
             rows = cursor.fetchall()
             retrieved = [int(r[0]) for r in rows]
             latency = time.time() - start
@@ -898,12 +915,12 @@ def main():
             baseline_ids,
         )
 
-        # Keep exact-binary (1x) for reference
-        print(f"[Query] Exact binary float32 rerank (1x overfetch)...")
+        # Keep exact-binary (1x) for reference (no rerank; pure Hamming)
+        print(f"[Query] Exact binary float32 (1x, no rerank)...")
         lat_bin_exact_k_vec, rec_bin_exact_k_vec = query_index(
             conn, tbl_vector, "vector", "binary_exact_k", dim, query_trunc, baseline_ids
         )
-        print(f"[Query] Exact binary float16 rerank (1x overfetch)...")
+        print(f"[Query] Exact binary float16 (1x, no rerank)...")
         lat_bin_exact_k_half, rec_bin_exact_k_half = query_index(
             conn, tbl_half, "halfvec", "binary_exact_k", dim, query_trunc, baseline_ids
         )
