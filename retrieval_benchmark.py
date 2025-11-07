@@ -75,7 +75,7 @@ def table_exists_and_populated(conn, table_name: str, expected_rows: int):
     try:
         cursor.execute(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = %s",
-            (table_name,)
+            (table_name,),
         )
         if cursor.fetchone()[0] == 0:
             cursor.close()
@@ -96,10 +96,14 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
     cursor.execute(f"DROP TABLE IF EXISTS {name}")
     dim = embeddings.shape[1]
     if precision == "vector":
-        cursor.execute(f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, embedding vector({dim}))")
+        cursor.execute(
+            f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, embedding vector({dim}))"
+        )
         cast = "::vector"
     elif precision == "halfvec":
-        cursor.execute(f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, embedding halfvec({dim}))")
+        cursor.execute(
+            f"CREATE TABLE {name} (id BIGINT PRIMARY KEY, embedding halfvec({dim}))"
+        )
         cast = "::halfvec"
     else:
         raise ValueError("precision must be vector or halfvec")
@@ -107,10 +111,17 @@ def create_and_insert_table(conn, name: str, embeddings: np.ndarray, precision: 
 
     ids = np.arange(embeddings.shape[0], dtype=np.int64)
 
-    for i in tqdm(range(0, embeddings.shape[0], BATCH_SIZE), desc=f"Insert {name}", unit="batch"):
+    for i in tqdm(
+        range(0, embeddings.shape[0], BATCH_SIZE), desc=f"Insert {name}", unit="batch"
+    ):
         batch_end = min(i + BATCH_SIZE, embeddings.shape[0])
         batch_data = [
-            (int(ids[j]), embeddings[j][:dim].astype(np.float16 if precision == "halfvec" else np.float32).tolist())
+            (
+                int(ids[j]),
+                embeddings[j][:dim]
+                .astype(np.float16 if precision == "halfvec" else np.float32)
+                .tolist(),
+            )
             for j in range(i, batch_end)
         ]
         execute_values(
@@ -175,7 +186,16 @@ def build_index(conn, table: str, precision: str, kind: str, dim: int):
     return idx_name, build_time
 
 
-def query_index(conn, table: str, precision: str, kind: str, dim: int, query_vec: np.ndarray, baseline_ids, debug=False):
+def query_index(
+    conn,
+    table: str,
+    precision: str,
+    kind: str,
+    dim: int,
+    query_vec: np.ndarray,
+    baseline_ids,
+    debug=False,
+):
     cursor = conn.cursor()
     # Prepare query textual forms
     query_list_full = query_vec[:dim].tolist()
@@ -187,12 +207,14 @@ def query_index(conn, table: str, precision: str, kind: str, dim: int, query_vec
         cast_type = "vector" if precision == "vector" else "halfvec"
         # Warm-up
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}", (query_txt,)
+            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            (query_txt,),
         )
         cursor.fetchall()
         start = time.time()
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}", (query_txt,)
+            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            (query_txt,),
         )
         rows = cursor.fetchall()
         retrieved = [r[0] for r in rows]
@@ -227,58 +249,6 @@ def query_index(conn, table: str, precision: str, kind: str, dim: int, query_vec
         LIMIT {K}
         """
 
-        # Debug: Check query plan for IVF binary
-        if debug and kind == "binary_ivf":
-            # Show current probe setting
-            cursor.execute("SHOW ivfflat.probes")
-            current_probes = cursor.fetchone()[0]
-            print(f"    [DEBUG] Current ivfflat.probes setting: {current_probes}")
-
-            # Show query plan
-            cursor.execute(f"EXPLAIN ANALYZE {query_sql}", (query_txt, query_txt))
-            plan = cursor.fetchall()
-            uses_index = any("Index" in str(row) for row in plan)
-            print(f"    [DEBUG] IVF binary query uses index: {uses_index}")
-            # Show first few lines of plan
-            for i, row in enumerate(plan[:5]):
-                print(f"    [DEBUG PLAN] {row[0]}")
-
-        # Debug: Check candidate count
-        if debug:
-            print(f"    [DEBUG] Requesting {overfetch} candidates from {table} (kind={kind})")
-            if kind == "binary_ivf":
-                print(f"    [DEBUG] IVF probes set to: {IVF_PROBES_BINARY}")
-
-            # Check how many candidates we actually get
-            cursor.execute(
-                f"SELECT COUNT(*) FROM (SELECT id FROM {table} ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim}) LIMIT {overfetch}) sub",
-                (query_txt,)
-            )
-            cand_count = cursor.fetchone()[0]
-
-            if cand_count < overfetch:
-                print(f"    [DEBUG] WARNING: Only got {cand_count}/{overfetch} candidates!")
-                if kind == "binary_ivf":
-                    cursor.execute("SET ivfflat.probes = 100")
-                    cursor.execute(
-                        f"SELECT COUNT(*) FROM (SELECT id FROM {table} ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim}) LIMIT {overfetch}) sub",
-                        (query_txt,)
-                    )
-                    all_probes_count = cursor.fetchone()[0]
-                    print(f"    [DEBUG] With ALL 100 probes: {all_probes_count}/{overfetch} candidates")
-                    cursor.execute(f"SET ivfflat.probes = {IVF_PROBES_BINARY}")
-
-            # Check overlap with baseline
-            cursor.execute(
-                f"SELECT id FROM {table} ORDER BY binary_quantize(embedding)::bit({dim}) <~> binary_quantize(%s::{precision})::bit({dim}) LIMIT {overfetch}",
-                (query_txt,)
-            )
-            cand_ids = [r[0] for r in cursor.fetchall()]
-            baseline_set = set(baseline_ids)
-            overlap = len(baseline_set & set(cand_ids))
-            print(f"    [DEBUG] Hamming overfetch found {len(cand_ids)} candidates")
-            print(f"    [DEBUG] Overlap with true top-{K}: {overlap}/{K} ({100*overlap/K:.1f}%)")
-
         # Warm-up
         cursor.execute(query_sql, (query_txt, query_txt))
         cursor.fetchall()
@@ -289,20 +259,18 @@ def query_index(conn, table: str, precision: str, kind: str, dim: int, query_vec
         rows = cursor.fetchall()
         retrieved = [r[0] for r in rows]
         latency = time.time() - start
-
-        # Debug: Final recall
-        if debug:
-            print(f"    [DEBUG] After SQL reranking: {len(set(retrieved) & baseline_set)}/{K} recall")
     else:
         # Warm-up
         cast_type = "vector" if precision == "vector" else "halfvec"
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}", (query_txt,)
+            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            (query_txt,),
         )
         cursor.fetchall()
         start = time.time()
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}", (query_txt,)
+            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            (query_txt,),
         )
         rows = cursor.fetchall()
         retrieved = [r[0] for r in rows]
@@ -318,9 +286,7 @@ def get_index_size_mb(conn, idx_name: str):
     if not idx_name:
         return 0.0
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT pg_total_relation_size(%s) / (1024.0*1024.0)", (idx_name,)
-    )
+    cursor.execute("SELECT pg_total_relation_size(%s) / (1024.0*1024.0)", (idx_name,))
     size_mb = cursor.fetchone()[0]
     cursor.close()
     return size_mb
@@ -328,7 +294,9 @@ def get_index_size_mb(conn, idx_name: str):
 
 def get_vector_storage_mb(num_vectors: int, dimensions: int, precision: str):
     """Calculate the storage size for vector data."""
-    bytes_per_value = 4 if precision == "float32" else 2  # float32=4 bytes, float16=2 bytes
+    bytes_per_value = (
+        4 if precision == "float32" else 2
+    )  # float32=4 bytes, float16=2 bytes
     total_bytes = num_vectors * dimensions * bytes_per_value
     # Add ~10% overhead for PostgreSQL storage (TOAST, alignment, etc.)
     return (total_bytes * 1.1) / (1024.0 * 1024.0)
@@ -338,15 +306,52 @@ def main():
     global IVF_LISTS, IVF_PROBES, IVF_PROBES_BINARY, HNSW_EF_SEARCH, OVERFETCH_FACTOR
 
     parser = argparse.ArgumentParser(description="Retrieval benchmark (TASK.md)")
-    parser.add_argument("--vectors-file", type=str, help="Path to .npy file with pre-generated vectors")
-    parser.add_argument("--size", type=int, default=50000, help="Number of vectors to use (default: 50000)")
-    parser.add_argument("--num-vectors", type=int, help="(Deprecated, use --size) Number of vectors to generate")
-    parser.add_argument("--ivf-lists", type=int, default=100, help="IVF lists parameter (default: 100)")
-    parser.add_argument("--ivf-probes", type=int, default=10, help="IVF probes parameter for non-binary (default: 10)")
-    parser.add_argument("--ivf-probes-binary", type=int, default=50, help="IVF probes for binary indices (default: 50)")
-    parser.add_argument("--hnsw-ef-search", type=int, default=200, help="HNSW ef_search for binary index (default: 200)")
-    parser.add_argument("--overfetch", type=int, default=10, help="Binary overfetch factor (default: 10)")
-    parser.add_argument("--force-reload", action="store_true", help="Force reload data even if tables exist")
+    parser.add_argument(
+        "--vectors-file", type=str, help="Path to .npy file with pre-generated vectors"
+    )
+    parser.add_argument(
+        "--size",
+        type=int,
+        default=50000,
+        help="Number of vectors to use (default: 50000)",
+    )
+    parser.add_argument(
+        "--num-vectors",
+        type=int,
+        help="(Deprecated, use --size) Number of vectors to generate",
+    )
+    parser.add_argument(
+        "--ivf-lists", type=int, default=100, help="IVF lists parameter (default: 100)"
+    )
+    parser.add_argument(
+        "--ivf-probes",
+        type=int,
+        default=10,
+        help="IVF probes parameter for non-binary (default: 10)",
+    )
+    parser.add_argument(
+        "--ivf-probes-binary",
+        type=int,
+        default=50,
+        help="IVF probes for binary indices (default: 50)",
+    )
+    parser.add_argument(
+        "--hnsw-ef-search",
+        type=int,
+        default=200,
+        help="HNSW ef_search for binary index (default: 200)",
+    )
+    parser.add_argument(
+        "--overfetch",
+        type=int,
+        default=10,
+        help="Binary overfetch factor (default: 10)",
+    )
+    parser.add_argument(
+        "--force-reload",
+        action="store_true",
+        help="Force reload data even if tables exist",
+    )
     args = parser.parse_args()
 
     # Handle backward compatibility for --num-vectors
@@ -369,11 +374,15 @@ def main():
         full_embeddings = np.load(args.vectors_file)
 
         if full_embeddings.ndim != 2:
-            raise ValueError(f"Expected 2D array from .npy file, got shape {full_embeddings.shape}")
+            raise ValueError(
+                f"Expected 2D array from .npy file, got shape {full_embeddings.shape}"
+            )
 
         # Limit to specified size
         if full_embeddings.shape[0] > num_vectors:
-            print(f"[Setup] Limiting vectors from {full_embeddings.shape[0]:,} to {num_vectors:,}")
+            print(
+                f"[Setup] Limiting vectors from {full_embeddings.shape[0]:,} to {num_vectors:,}"
+            )
             full_embeddings = full_embeddings[:num_vectors]
         else:
             num_vectors = full_embeddings.shape[0]
@@ -385,15 +394,21 @@ def main():
 
         # Pad or truncate to 1024 dimensions if needed
         if full_embeddings.shape[1] < 1024:
-            print(f"[Setup] Padding vectors from {full_embeddings.shape[1]} to 1024 dimensions")
+            print(
+                f"[Setup] Padding vectors from {full_embeddings.shape[1]} to 1024 dimensions"
+            )
             padded = np.zeros((full_embeddings.shape[0], 1024), dtype=np.float32)
-            padded[:, :full_embeddings.shape[1]] = full_embeddings
+            padded[:, : full_embeddings.shape[1]] = full_embeddings
             full_embeddings = padded
         elif full_embeddings.shape[1] > 1024:
-            print(f"[Setup] Truncating vectors from {full_embeddings.shape[1]} to 1024 dimensions")
+            print(
+                f"[Setup] Truncating vectors from {full_embeddings.shape[1]} to 1024 dimensions"
+            )
             full_embeddings = full_embeddings[:, :1024]
 
-        print(f"[Setup] Loaded {num_vectors:,} vectors with {full_embeddings.shape[1]} dimensions")
+        print(
+            f"[Setup] Loaded {num_vectors:,} vectors with {full_embeddings.shape[1]} dimensions"
+        )
     else:
         print(f"[Setup] Generating {num_vectors:,} normalized 1024-d embeddings...")
         full_embeddings = generate_embeddings(num_vectors)
@@ -410,9 +425,13 @@ def main():
     print("[Baseline] Computing brute force baseline (1024-D float32)...")
     baseline_ids_1024 = build_baseline(full_embeddings, query)
     print(f"[Baseline] Ground truth top-{K} computed using full 1024-D vectors")
-    print(f"[Baseline] Top-1 should be query itself (id={query_idx}): {baseline_ids_1024[0] == query_idx}")
+    print(
+        f"[Baseline] Top-1 should be query itself (id={query_idx}): {baseline_ids_1024[0] == query_idx}"
+    )
 
-    print(f"[Params] IVF: lists={IVF_LISTS}, probes={IVF_PROBES} (binary: {IVF_PROBES_BINARY}) | Binary: overfetch={OVERFETCH_FACTOR}x, hnsw_ef={HNSW_EF_SEARCH}")
+    print(
+        f"[Params] IVF: lists={IVF_LISTS}, probes={IVF_PROBES} (binary: {IVF_PROBES_BINARY}) | Binary: overfetch={OVERFETCH_FACTOR}x, hnsw_ef={HNSW_EF_SEARCH}"
+    )
 
     conn = ensure_connection()
     # Ensure required extensions; handle failures with rollback to avoid aborted transaction
@@ -443,7 +462,9 @@ def main():
         trunc_embeddings = trunc_embeddings / norms
 
         # Truncate query to match dimension (for querying the index)
-        query_trunc = query[:dim] / np.linalg.norm(query[:dim])  # Truncate and renormalize
+        query_trunc = query[:dim] / np.linalg.norm(
+            query[:dim]
+        )  # Truncate and renormalize
 
         # Use 1024-D ground truth baseline for ALL dimensions
         # This measures how well lower dimensions approximate the full 1024-D space
@@ -461,178 +482,197 @@ def main():
             print(f"[Storage] Creating + inserting float32 table {tbl_vector} ...")
             create_and_insert_table(conn, tbl_vector, trunc_embeddings, "vector")
         else:
-            print(f"[Storage] Skipping {tbl_vector} (already populated with {num_vectors:,} rows)")
+            print(
+                f"[Storage] Skipping {tbl_vector} (already populated with {num_vectors:,} rows)"
+            )
 
         if args.force_reload or not half_exists:
             print(f"[Storage] Creating + inserting float16 table {tbl_half} ...")
             create_and_insert_table(conn, tbl_half, trunc_embeddings, "halfvec")
         else:
-            print(f"[Storage] Skipping {tbl_half} (already populated with {num_vectors:,} rows)")
-
-        # Check unique bit vectors after binarization
-        cursor_debug = conn.cursor()
-        cursor_debug.execute(
-            f"SELECT COUNT(DISTINCT binary_quantize(embedding)::bit({dim})) FROM {tbl_vector}"
-        )
-        unique_bits = cursor_debug.fetchone()[0]
-        print(f"[Debug] After binarization: {unique_bits:,} unique bit patterns out of {num_vectors:,} vectors ({100*unique_bits/num_vectors:.1f}%)")
-
-        # Check IVF cluster distribution for binary index (if this dimension)
-        if dim == 1024:
-            # Sample some clusters to see distribution
-            cursor_debug.execute(f"""
-                SELECT COUNT(*) as cluster_size
-                FROM (
-                    SELECT binary_quantize(embedding)::bit({dim}) as bvec
-                    FROM {tbl_vector}
-                    LIMIT 1000
-                ) sub
-                GROUP BY bvec
-                ORDER BY cluster_size DESC
-                LIMIT 5
-            """)
-            top_clusters = cursor_debug.fetchall()
-            print(f"[Debug] Top 5 bit pattern frequencies (sample of 1000): {[c[0] for c in top_clusters]}")
-
-        cursor_debug.close()
+            print(
+                f"[Storage] Skipping {tbl_half} (already populated with {num_vectors:,} rows)"
+            )
 
         # Build indices
         print("[Index] Building VectorChord (vector)...")
-        idx_vchord_vec, t_vchord_vec = build_index(conn, tbl_vector, "vector", "full", dim)
+        idx_vchord_vec, t_vchord_vec = build_index(
+            conn, tbl_vector, "vector", "full", dim
+        )
         print("[Index] Building VectorChord (halfvec)...")
-        idx_vchord_half, t_vchord_half = build_index(conn, tbl_half, "halfvec", "half", dim)
+        idx_vchord_half, t_vchord_half = build_index(
+            conn, tbl_half, "halfvec", "half", dim
+        )
         print(f"[Index] Building IVFFlat (vector, lists={IVF_LISTS})...")
         idx_ivf_vec, t_ivf_vec = build_index(conn, tbl_vector, "vector", "ivf", dim)
         print(f"[Index] Building IVFFlat (halfvec, lists={IVF_LISTS})...")
         idx_ivf_half, t_ivf_half = build_index(conn, tbl_half, "halfvec", "ivf", dim)
         print("[Index] Building HNSW binary (bit, float32 rerank) ...")
-        idx_hnsw_bin, t_hnsw_bin = build_index(conn, tbl_vector, "vector", "binary_hnsw", dim)
+        idx_hnsw_bin, t_hnsw_bin = build_index(
+            conn, tbl_vector, "vector", "binary_hnsw", dim
+        )
         print("[Index] Building HNSW binary (bit, float16 rerank) ...")
-        idx_hnsw_bin_half, t_hnsw_bin_half = build_index(conn, tbl_half, "halfvec", "binary_hnsw", dim)
-        print(f"[Index] Building IVFFlat binary (bit, float32 rerank, lists={IVF_LISTS}) ...")
-        idx_ivf_bin, t_ivf_bin = build_index(conn, tbl_vector, "vector", "binary_ivf", dim)
-        print(f"[Index] Building IVFFlat binary (bit, float16 rerank, lists={IVF_LISTS}) ...")
-        idx_ivf_bin_half, t_ivf_bin_half = build_index(conn, tbl_half, "halfvec", "binary_ivf", dim)
+        idx_hnsw_bin_half, t_hnsw_bin_half = build_index(
+            conn, tbl_half, "halfvec", "binary_hnsw", dim
+        )
+        print(
+            f"[Index] Building IVFFlat binary (bit, float32 rerank, lists={IVF_LISTS}) ..."
+        )
+        idx_ivf_bin, t_ivf_bin = build_index(
+            conn, tbl_vector, "vector", "binary_ivf", dim
+        )
+        print(
+            f"[Index] Building IVFFlat binary (bit, float16 rerank, lists={IVF_LISTS}) ..."
+        )
+        idx_ivf_bin_half, t_ivf_bin_half = build_index(
+            conn, tbl_half, "halfvec", "binary_ivf", dim
+        )
 
         # Query each
         print("[Query] VectorChord full precision...")
-        lat_vchord_vec, rec_vchord_vec = query_index(conn, tbl_vector, "vector", "full", dim, query_trunc, baseline_ids)
+        lat_vchord_vec, rec_vchord_vec = query_index(
+            conn, tbl_vector, "vector", "full", dim, query_trunc, baseline_ids
+        )
         size_vchord_vec = get_index_size_mb(conn, idx_vchord_vec)
 
         print("[Query] VectorChord half precision...")
-        lat_vchord_half, rec_vchord_half = query_index(conn, tbl_half, "halfvec", "half", dim, query_trunc, baseline_ids)
+        lat_vchord_half, rec_vchord_half = query_index(
+            conn, tbl_half, "halfvec", "half", dim, query_trunc, baseline_ids
+        )
         size_vchord_half = get_index_size_mb(conn, idx_vchord_half)
 
         print(f"[Query] IVFFlat full precision (probes={IVF_PROBES})...")
-        lat_ivf_vec, rec_ivf_vec = query_index(conn, tbl_vector, "vector", "ivf", dim, query_trunc, baseline_ids)
+        lat_ivf_vec, rec_ivf_vec = query_index(
+            conn, tbl_vector, "vector", "ivf", dim, query_trunc, baseline_ids
+        )
         size_ivf_vec = get_index_size_mb(conn, idx_ivf_vec)
 
         print(f"[Query] IVFFlat half precision (probes={IVF_PROBES})...")
-        lat_ivf_half, rec_ivf_half = query_index(conn, tbl_half, "halfvec", "ivf", dim, query_trunc, baseline_ids)
+        lat_ivf_half, rec_ivf_half = query_index(
+            conn, tbl_half, "halfvec", "ivf", dim, query_trunc, baseline_ids
+        )
         size_ivf_half = get_index_size_mb(conn, idx_ivf_half)
 
-        print(f"[Query] HNSW binary float32 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)...")
-        lat_hnsw_bin, rec_hnsw_bin = query_index(conn, tbl_vector, "vector", "binary_hnsw", dim, query_trunc, baseline_ids, debug=True)
+        print(
+            f"[Query] HNSW binary float32 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_hnsw_bin, rec_hnsw_bin = query_index(
+            conn, tbl_vector, "vector", "binary_hnsw", dim, query_trunc, baseline_ids
+        )
         size_hnsw_bin = get_index_size_mb(conn, idx_hnsw_bin)
 
-        print(f"[Query] HNSW binary float16 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)...")
-        lat_hnsw_bin_half, rec_hnsw_bin_half = query_index(conn, tbl_half, "halfvec", "binary_hnsw", dim, query_trunc, baseline_ids, debug=True)
+        print(
+            f"[Query] HNSW binary float16 rerank (ef={HNSW_EF_SEARCH}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_hnsw_bin_half, rec_hnsw_bin_half = query_index(
+            conn, tbl_half, "halfvec", "binary_hnsw", dim, query_trunc, baseline_ids
+        )
         size_hnsw_bin_half = get_index_size_mb(conn, idx_hnsw_bin_half)
 
-        print(f"[Query] IVFFlat binary float32 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)...")
-        lat_ivf_bin, rec_ivf_bin = query_index(conn, tbl_vector, "vector", "binary_ivf", dim, query_trunc, baseline_ids, debug=True)
+        print(
+            f"[Query] IVFFlat binary float32 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_ivf_bin, rec_ivf_bin = query_index(
+            conn, tbl_vector, "vector", "binary_ivf", dim, query_trunc, baseline_ids
+        )
         size_ivf_bin = get_index_size_mb(conn, idx_ivf_bin)
 
-        print(f"[Query] IVFFlat binary float16 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)...")
-        lat_ivf_bin_half, rec_ivf_bin_half = query_index(conn, tbl_half, "halfvec", "binary_ivf", dim, query_trunc, baseline_ids, debug=True)
+        print(
+            f"[Query] IVFFlat binary float16 rerank (probes={IVF_PROBES_BINARY}, {OVERFETCH_FACTOR}x overfetch)..."
+        )
+        lat_ivf_bin_half, rec_ivf_bin_half = query_index(
+            conn, tbl_half, "halfvec", "binary_ivf", dim, query_trunc, baseline_ids
+        )
         size_ivf_bin_half = get_index_size_mb(conn, idx_ivf_bin_half)
 
         # Calculate storage sizes based on actual vector dimensions and precision
         storage_vec_mb = get_vector_storage_mb(num_vectors, dim, "float32")
         storage_half_mb = get_vector_storage_mb(num_vectors, dim, "float16")
 
-        results.extend([
-            {
-                "dim": dim,
-                "storage": "float32",
-                "index": "vchordrq",
-                "lat_ms": lat_vchord_vec * 1000,
-                "recall": rec_vchord_vec,
-                "build_s": t_vchord_vec,
-                "index_mb": size_vchord_vec,
-                "storage_mb": storage_vec_mb,
-            },
-            {
-                "dim": dim,
-                "storage": "float16",
-                "index": "vchordrq",
-                "lat_ms": lat_vchord_half * 1000,
-                "recall": rec_vchord_half,
-                "build_s": t_vchord_half,
-                "index_mb": size_vchord_half,
-                "storage_mb": storage_half_mb,
-            },
-            {
-                "dim": dim,
-                "storage": "float32",
-                "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
-                "lat_ms": lat_ivf_vec * 1000,
-                "recall": rec_ivf_vec,
-                "build_s": t_ivf_vec,
-                "index_mb": size_ivf_vec,
-                "storage_mb": storage_vec_mb,
-            },
-            {
-                "dim": dim,
-                "storage": "float16",
-                "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
-                "lat_ms": lat_ivf_half * 1000,
-                "recall": rec_ivf_half,
-                "build_s": t_ivf_half,
-                "index_mb": size_ivf_half,
-                "storage_mb": storage_half_mb,
-            },
-            {
-                "dim": dim,
-                "storage": "float32",
-                "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_hnsw_bin * 1000,
-                "recall": rec_hnsw_bin,
-                "build_s": t_hnsw_bin,
-                "index_mb": size_hnsw_bin,
-                "storage_mb": storage_vec_mb,
-            },
-            {
-                "dim": dim,
-                "storage": "float16",
-                "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_hnsw_bin_half * 1000,
-                "recall": rec_hnsw_bin_half,
-                "build_s": t_hnsw_bin_half,
-                "index_mb": size_hnsw_bin_half,
-                "storage_mb": storage_half_mb,
-            },
-            {
-                "dim": dim,
-                "storage": "float32",
-                "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_ivf_bin * 1000,
-                "recall": rec_ivf_bin,
-                "build_s": t_ivf_bin,
-                "index_mb": size_ivf_bin,
-                "storage_mb": storage_vec_mb,
-            },
-            {
-                "dim": dim,
-                "storage": "float16",
-                "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
-                "lat_ms": lat_ivf_bin_half * 1000,
-                "recall": rec_ivf_bin_half,
-                "build_s": t_ivf_bin_half,
-                "index_mb": size_ivf_bin_half,
-                "storage_mb": storage_half_mb,
-            },
-        ])
+        results.extend(
+            [
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": "vchordrq",
+                    "lat_ms": lat_vchord_vec * 1000,
+                    "recall": rec_vchord_vec,
+                    "build_s": t_vchord_vec,
+                    "index_mb": size_vchord_vec,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": "vchordrq",
+                    "lat_ms": lat_vchord_half * 1000,
+                    "recall": rec_vchord_half,
+                    "build_s": t_vchord_half,
+                    "index_mb": size_vchord_half,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
+                    "lat_ms": lat_ivf_vec * 1000,
+                    "recall": rec_ivf_vec,
+                    "build_s": t_ivf_vec,
+                    "index_mb": size_ivf_vec,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"ivfflat(L{IVF_LISTS},P{IVF_PROBES})",
+                    "lat_ms": lat_ivf_half * 1000,
+                    "recall": rec_ivf_half,
+                    "build_s": t_ivf_half,
+                    "index_mb": size_ivf_half,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin * 1000,
+                    "recall": rec_hnsw_bin,
+                    "build_s": t_hnsw_bin,
+                    "index_mb": size_hnsw_bin,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"hnsw+binary(ef{HNSW_EF_SEARCH},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_hnsw_bin_half * 1000,
+                    "recall": rec_hnsw_bin_half,
+                    "build_s": t_hnsw_bin_half,
+                    "index_mb": size_hnsw_bin_half,
+                    "storage_mb": storage_half_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float32",
+                    "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin * 1000,
+                    "recall": rec_ivf_bin,
+                    "build_s": t_ivf_bin,
+                    "index_mb": size_ivf_bin,
+                    "storage_mb": storage_vec_mb,
+                },
+                {
+                    "dim": dim,
+                    "storage": "float16",
+                    "index": f"ivf+binary(L{IVF_LISTS},P{IVF_PROBES_BINARY},{OVERFETCH_FACTOR}x)",
+                    "lat_ms": lat_ivf_bin_half * 1000,
+                    "recall": rec_ivf_bin_half,
+                    "build_s": t_ivf_bin_half,
+                    "index_mb": size_ivf_bin_half,
+                    "storage_mb": storage_half_mb,
+                },
+            ]
+        )
 
     conn.close()
 
@@ -642,7 +682,16 @@ def main():
     print("=" * 140)
 
     # Column headers
-    headers = ["Dim", "Storage", "Index", "Latency", "Recall", "Build", "Storage", "Index"]
+    headers = [
+        "Dim",
+        "Storage",
+        "Index",
+        "Latency",
+        "Recall",
+        "Build",
+        "Storage",
+        "Index",
+    ]
     units = ["", "", "", "(ms)", "(%)", "(s)", "(MB)", "(MB)"]
 
     # Calculate column widths
@@ -658,42 +707,48 @@ def main():
     }
 
     # Print header
-    print(f"{'Dim':<{col_widths['dim']}} "
-          f"{'Storage':<{col_widths['storage']}} "
-          f"{'Index':<{col_widths['index']}} "
-          f"{'Latency':<{col_widths['lat_ms']}} "
-          f"{'Recall':<{col_widths['recall']}} "
-          f"{'Build':<{col_widths['build_s']}} "
-          f"{'Storage':<{col_widths['storage_mb']}} "
-          f"{'Index':<{col_widths['index_mb']}}")
+    print(
+        f"{'Dim':<{col_widths['dim']}} "
+        f"{'Storage':<{col_widths['storage']}} "
+        f"{'Index':<{col_widths['index']}} "
+        f"{'Latency':<{col_widths['lat_ms']}} "
+        f"{'Recall':<{col_widths['recall']}} "
+        f"{'Build':<{col_widths['build_s']}} "
+        f"{'Storage':<{col_widths['storage_mb']}} "
+        f"{'Index':<{col_widths['index_mb']}}"
+    )
 
-    print(f"{'':>{col_widths['dim']}} "
-          f"{'':>{col_widths['storage']}} "
-          f"{'':>{col_widths['index']}} "
-          f"{'(ms)':>{col_widths['lat_ms']}} "
-          f"{'(%)':>{col_widths['recall']}} "
-          f"{'(s)':>{col_widths['build_s']}} "
-          f"{'(MB)':>{col_widths['storage_mb']}} "
-          f"{'(MB)':>{col_widths['index_mb']}}")
+    print(
+        f"{'':>{col_widths['dim']}} "
+        f"{'':>{col_widths['storage']}} "
+        f"{'':>{col_widths['index']}} "
+        f"{'(ms)':>{col_widths['lat_ms']}} "
+        f"{'(%)':>{col_widths['recall']}} "
+        f"{'(s)':>{col_widths['build_s']}} "
+        f"{'(MB)':>{col_widths['storage_mb']}} "
+        f"{'(MB)':>{col_widths['index_mb']}}"
+    )
 
     print("-" * 140)
 
     # Print rows grouped by dimension
     current_dim = None
     for r in results:
-        if current_dim != r['dim']:
+        if current_dim != r["dim"]:
             if current_dim is not None:
                 print("-" * 140)
-            current_dim = r['dim']
+            current_dim = r["dim"]
 
-        print(f"{r['dim']:<{col_widths['dim']}} "
-              f"{r['storage']:<{col_widths['storage']}} "
-              f"{r['index']:<{col_widths['index']}} "
-              f"{r['lat_ms']:>{col_widths['lat_ms']}.2f} "
-              f"{r['recall']*100:>{col_widths['recall']}.1f} "
-              f"{r['build_s']:>{col_widths['build_s']}.2f} "
-              f"{r['storage_mb']:>{col_widths['storage_mb']}.1f} "
-              f"{r['index_mb']:>{col_widths['index_mb']}.1f}")
+        print(
+            f"{r['dim']:<{col_widths['dim']}} "
+            f"{r['storage']:<{col_widths['storage']}} "
+            f"{r['index']:<{col_widths['index']}} "
+            f"{r['lat_ms']:>{col_widths['lat_ms']}.2f} "
+            f"{r['recall'] * 100:>{col_widths['recall']}.1f} "
+            f"{r['build_s']:>{col_widths['build_s']}.2f} "
+            f"{r['storage_mb']:>{col_widths['storage_mb']}.1f} "
+            f"{r['index_mb']:>{col_widths['index_mb']}.1f}"
+        )
 
     print("=" * 140)
 
