@@ -65,9 +65,6 @@ VCHORDRQ_EPSILON = (
 VCHORDRQ_BUILD_THREADS = 8  # Build threads for K-means clustering (range: 1-255)
 VCHORDRQ_LISTS = 1000  # Number of clusters for vchordrq index
 VCHORDRQ_PROBES = 10  # Number of clusters to search (higher = better recall, slower)
-VCHORDRQ_RESIDUAL_QUANTIZATION = (
-    True  # Enable residual quantization for improved accuracy
-)
 VCHORDRQ_SPHERICAL_CENTROIDS = (
     True  # Enable spherical centroids (recommended with cosine similarity)
 )
@@ -566,7 +563,7 @@ def build_index(
         start = time.time()
         cursor.execute(
             f"CREATE INDEX {idx_name} ON {table} USING vchordrq (embedding {ops}) WITH (options = $$\n"
-            f"residual_quantization = {str(VCHORDRQ_RESIDUAL_QUANTIZATION).lower()}\n"
+            f"rerank_in_table = true\n"
             f"[build.internal]\n"
             f"lists = [{VCHORDRQ_LISTS}]\n"
             f"spherical_centroids = {str(VCHORDRQ_SPHERICAL_CENTROIDS).lower()}\n"
