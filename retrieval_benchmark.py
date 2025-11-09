@@ -64,6 +64,7 @@ VCHORDRQ_EPSILON = (
 )
 VCHORDRQ_BUILD_THREADS = 8  # Build threads for K-means clustering (range: 1-255)
 VCHORDRQ_LISTS = 1000  # Number of clusters for vchordrq index
+VCHORDRQ_PROBES = 10  # Number of clusters to search (higher = better recall, slower)
 VCHORDRQ_RESIDUAL_QUANTIZATION = (
     True  # Enable residual quantization for improved accuracy
 )
@@ -998,8 +999,9 @@ def query_index(
             except Exception:
                 pass
     else:
-        # VectorChord vchordrq - set RaBitQ epsilon
+        # VectorChord vchordrq - set RaBitQ epsilon and probes
         cursor.execute(f"SET vchordrq.epsilon = {VCHORDRQ_EPSILON}")
+        cursor.execute(f"SET vchordrq.probes = {VCHORDRQ_PROBES}")
         # Warm-up
         cast_type = "vector" if precision == "vector" else "halfvec"
         cursor.execute(
