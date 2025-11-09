@@ -58,6 +58,19 @@ HNSW_EF_CONSTRUCTION = 300
 # NEW: upper cap for hnsw.ef_search to satisfy server limits (e.g., 1..1000)
 HNSW_EF_SEARCH_MAX = 1000
 
+# VectorChord vchordrq parameters
+VCHORDRQ_EPSILON = (
+    1.9  # RaBitQ epsilon (range: 0.0-4.0; higher = more accurate, slower)
+)
+VCHORDRQ_BUILD_THREADS = 8  # Build threads for K-means clustering (range: 1-255)
+VCHORDRQ_LISTS = 1000  # Number of clusters for vchordrq index
+VCHORDRQ_RESIDUAL_QUANTIZATION = (
+    True  # Enable residual quantization for improved accuracy
+)
+VCHORDRQ_SPHERICAL_CENTROIDS = (
+    True  # Enable spherical centroids (recommended with cosine similarity)
+)
+
 
 # NEW: simple heuristic for IVFFlat params based on dataset size (N) and k
 def _clamp(v, lo, hi):
@@ -120,7 +133,9 @@ def compute_percentile_thresholds(embeddings: np.ndarray, num_buckets: int = 8):
     num_thresholds = num_buckets - 1
 
     # Compute percentiles for each bucket boundary
-    percentiles = np.linspace(100.0 / num_buckets, 100.0 * (num_buckets - 1) / num_buckets, num_thresholds)
+    percentiles = np.linspace(
+        100.0 / num_buckets, 100.0 * (num_buckets - 1) / num_buckets, num_thresholds
+    )
 
     # Compute thresholds for each dimension
     thresholds = np.zeros((num_dims, num_thresholds), dtype=np.float32)
@@ -130,7 +145,9 @@ def compute_percentile_thresholds(embeddings: np.ndarray, num_buckets: int = 8):
     return thresholds
 
 
-def encode_thermometer(embeddings: np.ndarray, thresholds: np.ndarray, num_bits_per_dim: int = None):
+def encode_thermometer(
+    embeddings: np.ndarray, thresholds: np.ndarray, num_bits_per_dim: int = None
+):
     """Encode vectors using thermometer/unary code.
 
     For each dimension, compares value against all thresholds:
@@ -161,7 +178,9 @@ def encode_thermometer(embeddings: np.ndarray, thresholds: np.ndarray, num_bits_
         for bit_idx in range(num_thresholds):
             # Set bit to 1 if value >= threshold
             bit_position = dim * num_bits_per_dim + bit_idx
-            encoded[:, bit_position] = (embeddings[:, dim] >= thresholds[dim, bit_idx]).astype(np.uint8)
+            encoded[:, bit_position] = (
+                embeddings[:, dim] >= thresholds[dim, bit_idx]
+            ).astype(np.uint8)
 
     # Note: bits num_thresholds to num_bits_per_dim-1 remain 0 (padding)
     # For 7 thresholds (8 buckets), bits 0-6 are used, bit 7 is always 0
@@ -170,7 +189,9 @@ def encode_thermometer(embeddings: np.ndarray, thresholds: np.ndarray, num_bits_
     return encoded
 
 
-def encode_one_hot(embeddings: np.ndarray, thresholds: np.ndarray, num_bits_per_dim: int = None):
+def encode_one_hot(
+    embeddings: np.ndarray, thresholds: np.ndarray, num_bits_per_dim: int = None
+):
     """Encode vectors using one-hot/categorical code.
 
     For each dimension, finds which bucket the value falls into and sets only that bit:
@@ -237,7 +258,12 @@ def ensure_connection():
 
 
 def table_exists_and_populated(
-    conn, table_name: str, expected_rows: int, check_mean_bin=False, check_uint8_bin=False, check_uint4_bin=False
+    conn,
+    table_name: str,
+    expected_rows: int,
+    check_mean_bin=False,
+    check_uint8_bin=False,
+    check_uint4_bin=False,
 ):
     """Check if table exists and has the expected number of rows."""
     cursor = conn.cursor()
@@ -386,7 +412,9 @@ def create_and_insert_table(
     binary_vecs_uint4 = None
 
     if use_mean_binarization and dimension_means is not None:
-        binary_vecs_mean = binarize_with_means(embeddings[:, :dim], dimension_means[:dim])
+        binary_vecs_mean = binarize_with_means(
+            embeddings[:, :dim], dimension_means[:dim]
+        )
 
     # Select encoding function based on encoding_type parameter
     encode_fn = encode_thermometer if encoding_type == "thermometer" else encode_one_hot
@@ -451,7 +479,14 @@ def create_and_insert_table(
 
 
 def build_index(
-    conn, table: str, precision: str, kind: str, dim: int, use_mean_bin=False, use_uint8_bin=False, use_uint4_bin=False
+    conn,
+    table: str,
+    precision: str,
+    kind: str,
+    dim: int,
+    use_mean_bin=False,
+    use_uint8_bin=False,
+    use_uint4_bin=False,
 ):
     cursor = conn.cursor()
     if kind == "binary_hnsw":
@@ -529,7 +564,13 @@ def build_index(
         cursor.execute(f"DROP INDEX IF EXISTS {idx_name}")
         start = time.time()
         cursor.execute(
-            f"CREATE INDEX {idx_name} ON {table} USING vchordrq (embedding {ops})"
+            f"CREATE INDEX {idx_name} ON {table} USING vchordrq (embedding {ops}) WITH (options = $$\n"
+            f"residual_quantization = {str(VCHORDRQ_RESIDUAL_QUANTIZATION).lower()}\n"
+            f"[build.internal]\n"
+            f"lists = [{VCHORDRQ_LISTS}]\n"
+            f"spherical_centroids = {str(VCHORDRQ_SPHERICAL_CENTROIDS).lower()}\n"
+            f"build_threads = {VCHORDRQ_BUILD_THREADS}\n"
+            f"$$)"
         )
     conn.commit()
     build_time = time.time() - start
@@ -957,6 +998,8 @@ def query_index(
             except Exception:
                 pass
     else:
+        # VectorChord vchordrq - set RaBitQ epsilon
+        cursor.execute(f"SET vchordrq.epsilon = {VCHORDRQ_EPSILON}")
         # Warm-up
         cast_type = "vector" if precision == "vector" else "halfvec"
         cursor.execute(
@@ -1265,13 +1308,17 @@ def main():
     try:
         requested_dims = [int(d.strip()) for d in args.dimensions.split(",")]
     except ValueError:
-        print(f"[Error] Invalid dimensions format: '{args.dimensions}'. Expected comma-separated integers.")
+        print(
+            f"[Error] Invalid dimensions format: '{args.dimensions}'. Expected comma-separated integers."
+        )
         return
 
     max_dim = full_embeddings.shape[1]
     invalid_dims = [d for d in requested_dims if d > max_dim or d <= 0]
     if invalid_dims:
-        print(f"[Error] Invalid dimensions {invalid_dims}: must be positive and not exceed vector dimensions ({max_dim})")
+        print(
+            f"[Error] Invalid dimensions {invalid_dims}: must be positive and not exceed vector dimensions ({max_dim})"
+        )
         return
 
     # Use requested dimensions (sorted for consistency)
@@ -1292,8 +1339,12 @@ def main():
     uint8_thresholds_1024 = None
     if args.enable_quasi_uint8:
         print("[Setup] Computing percentile thresholds for quasi-uint8 binarization...")
-        uint8_thresholds_1024 = compute_percentile_thresholds(full_embeddings, num_buckets=8)
-        print(f"[Setup] Computed 7 thresholds per dimension (8 buckets) for all 1024 dimensions")
+        uint8_thresholds_1024 = compute_percentile_thresholds(
+            full_embeddings, num_buckets=8
+        )
+        print(
+            f"[Setup] Computed 7 thresholds per dimension (8 buckets) for all 1024 dimensions"
+        )
         print(
             f"[Setup] Threshold range: [{uint8_thresholds_1024.min():.6f}, {uint8_thresholds_1024.max():.6f}]"
         )
@@ -1302,8 +1353,12 @@ def main():
     uint4_thresholds_1024 = None
     if args.enable_quasi_uint4:
         print("[Setup] Computing percentile thresholds for quasi-uint4 binarization...")
-        uint4_thresholds_1024 = compute_percentile_thresholds(full_embeddings, num_buckets=4)
-        print(f"[Setup] Computed 3 thresholds per dimension (4 buckets) for all 1024 dimensions")
+        uint4_thresholds_1024 = compute_percentile_thresholds(
+            full_embeddings, num_buckets=4
+        )
+        print(
+            f"[Setup] Computed 3 thresholds per dimension (4 buckets) for all 1024 dimensions"
+        )
         print(
             f"[Setup] Threshold range: [{uint4_thresholds_1024.min():.6f}, {uint4_thresholds_1024.max():.6f}]"
         )
@@ -1390,16 +1445,20 @@ def main():
 
         # Check if tables already exist and are populated
         vec_exists = table_exists_and_populated(
-            conn, tbl_vector, num_vectors,
+            conn,
+            tbl_vector,
+            num_vectors,
             check_mean_bin=args.enable_mean_binarization,
             check_uint8_bin=args.enable_quasi_uint8,
-            check_uint4_bin=args.enable_quasi_uint4
+            check_uint4_bin=args.enable_quasi_uint4,
         )
         half_exists = table_exists_and_populated(
-            conn, tbl_half, num_vectors,
+            conn,
+            tbl_half,
+            num_vectors,
             check_mean_bin=args.enable_mean_binarization,
             check_uint8_bin=args.enable_quasi_uint8,
-            check_uint4_bin=args.enable_quasi_uint4
+            check_uint4_bin=args.enable_quasi_uint4,
         )
 
         if args.force_reload or not vec_exists:
@@ -1872,7 +1931,9 @@ def main():
                     use_uint8_bin=True,
                     uint8_thresholds=uint8_thresholds_1024,
                 )
-                size_ivf_bin_half_uint8 = get_index_size_mb(conn, idx_ivf_bin_half_uint8)
+                size_ivf_bin_half_uint8 = get_index_size_mb(
+                    conn, idx_ivf_bin_half_uint8
+                )
 
             if args.enable_quasi_uint4:
                 print(
@@ -1907,7 +1968,9 @@ def main():
                     use_uint4_bin=True,
                     uint4_thresholds=uint4_thresholds_1024,
                 )
-                size_ivf_bin_half_uint4 = get_index_size_mb(conn, idx_ivf_bin_half_uint4)
+                size_ivf_bin_half_uint4 = get_index_size_mb(
+                    conn, idx_ivf_bin_half_uint4
+                )
 
         # Binary exact queries
         if "binary-exact" in benchmarks:
@@ -2075,8 +2138,12 @@ def main():
         storage_half_mb = get_vector_storage_mb(num_vectors, dim, "float16")
 
         # Calculate binary-only storage sizes (for exact queries that don't use float columns)
-        storage_uint8_mb = get_binary_storage_mb(num_vectors, dim, bits_per_dim=8)  # uint8: 8 bits per dimension
-        storage_uint4_mb = get_binary_storage_mb(num_vectors, dim, bits_per_dim=4)  # uint4: 4 bits per dimension
+        storage_uint8_mb = get_binary_storage_mb(
+            num_vectors, dim, bits_per_dim=8
+        )  # uint8: 8 bits per dimension
+        storage_uint4_mb = get_binary_storage_mb(
+            num_vectors, dim, bits_per_dim=4
+        )  # uint4: 4 bits per dimension
 
         # Collect results (conditionally based on which benchmarks ran)
         if "vchordrq" in benchmarks:
