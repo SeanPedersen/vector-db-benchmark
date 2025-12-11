@@ -46,7 +46,7 @@ INDEX_CONFIGS = {
         "binary": False,
     },
     "diskann": {
-        "precisions": ["f32", "f16"],
+        "precisions": ["f32"],  # DiskANN does not support halfvec
         "binary": False,
     },
     "hnsw": {

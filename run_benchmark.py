@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Example: Unified Vector Database Benchmark
+Unified Vector Database Benchmark
 
-This script demonstrates the unified benchmark approach that tests all combinations of:
+This script benchmarks vector database performance using real embeddings from a .npy file.
+
+Tests all combinations of:
 - Data types: float32 (f32), float16 (f16), binary (mean, uint8, uint4)
 - Matryoshka dimensions: 256, 512, 1024
 - Indexes: vchordrq, ivfflat, hnsw, diskann, binary variants, exact
 
-Key improvements over the original approach:
+Key features:
 1. Single unified table per dimension with columns: embedding_f32, embedding_f16, embedding_bin_*
 2. Eliminates data duplication between float32/float16 tables
 3. Systematic testing via INDEX_CONFIGS matrix
-4. DiskANN and HNSW integration
-5. Cleaner, more maintainable code structure
+4. Smart caching of tables based on data source
+5. Requires real embeddings from .npy file (no random vectors)
 """
 
 import numpy as np
@@ -28,11 +30,10 @@ from database import (
 )
 from queries import query_index
 from embeddings import (
-    generate_embeddings,
     compute_dimension_means,
     compute_percentile_thresholds,
 )
-from metrics import build_baseline
+from metrics import build_baseline, get_vector_storage_mb
 
 
 def run_unified_benchmark(
@@ -40,6 +41,7 @@ def run_unified_benchmark(
     dimensions=[256, 512, 1024],
     selected_benchmarks=None,
     vectors_file=None,
+    force_reload=False,
 ):
     """Run unified benchmark with specified parameters.
 
@@ -47,42 +49,41 @@ def run_unified_benchmark(
         num_vectors: Number of vectors to test
         dimensions: List of matryoshka dimensions to test
         selected_benchmarks: List of benchmark names to run (None = all)
-        vectors_file: Path to .npy file with pre-generated vectors (optional)
+        vectors_file: Path to .npy file with pre-generated vectors (required)
+        force_reload: Force reload data even if tables exist (ignores cache)
     """
 
-    # Load or generate embeddings
-    if vectors_file:
-        print(f"[Setup] Loading vectors from {vectors_file}...")
-        full_embeddings = np.load(vectors_file)
+    # Load embeddings from file (required)
+    if not vectors_file:
+        raise ValueError("--vectors-file is required. Please provide a path to a .npy file with vectors.")
 
-        if full_embeddings.ndim != 2:
-            raise ValueError(f"Expected 2D array, got shape {full_embeddings.shape}")
+    print(f"[Setup] Loading vectors from {vectors_file}...")
+    full_embeddings = np.load(vectors_file)
 
-        # Limit to specified size
-        if full_embeddings.shape[0] > num_vectors:
-            print(f"[Setup] Limiting to {num_vectors:,} vectors")
-            full_embeddings = full_embeddings[:num_vectors]
-        else:
-            num_vectors = full_embeddings.shape[0]
-            print(f"[Setup] Using all {num_vectors:,} vectors from file")
+    if full_embeddings.ndim != 2:
+        raise ValueError(f"Expected 2D array, got shape {full_embeddings.shape}")
 
-        # Ensure normalized
-        norms = np.linalg.norm(full_embeddings, axis=1, keepdims=True)
-        full_embeddings = full_embeddings / norms
-
-        # Pad or truncate to 1024 dimensions
-        if full_embeddings.shape[1] < 1024:
-            print(f"[Setup] Padding from {full_embeddings.shape[1]} to 1024 dimensions")
-            padded = np.zeros((full_embeddings.shape[0], 1024), dtype=np.float32)
-            padded[:, :full_embeddings.shape[1]] = full_embeddings
-            full_embeddings = padded
-        elif full_embeddings.shape[1] > 1024:
-            print(f"[Setup] Truncating from {full_embeddings.shape[1]} to 1024 dimensions")
-            full_embeddings = full_embeddings[:, :1024]
+    # Limit to specified size
+    if full_embeddings.shape[0] > num_vectors:
+        print(f"[Setup] Limiting to {num_vectors:,} vectors")
+        full_embeddings = full_embeddings[:num_vectors]
     else:
-        # Generate random embeddings
-        print(f"[Setup] Generating {num_vectors:,} random vectors at 1024 dimensions...")
-        full_embeddings = generate_embeddings(num_vectors, 1024)
+        num_vectors = full_embeddings.shape[0]
+        print(f"[Setup] Using all {num_vectors:,} vectors from file")
+
+    # Ensure normalized
+    norms = np.linalg.norm(full_embeddings, axis=1, keepdims=True)
+    full_embeddings = full_embeddings / norms
+
+    # Pad or truncate to 1024 dimensions
+    if full_embeddings.shape[1] < 1024:
+        print(f"[Setup] Padding from {full_embeddings.shape[1]} to 1024 dimensions")
+        padded = np.zeros((full_embeddings.shape[0], 1024), dtype=np.float32)
+        padded[:, :full_embeddings.shape[1]] = full_embeddings
+        full_embeddings = padded
+    elif full_embeddings.shape[1] > 1024:
+        print(f"[Setup] Truncating from {full_embeddings.shape[1]} to 1024 dimensions")
+        full_embeddings = full_embeddings[:, :1024]
 
     # Use a random vector from the dataset as the query (more realistic)
     print("[Setup] Selecting random query vector from dataset...")
@@ -128,14 +129,9 @@ def run_unified_benchmark(
     print(f"[Setup] Testing dimensions: {dimensions}")
 
     # Determine data source identifier and caching strategy
-    # Only cache file-based vectors since random vectors are meaningless to cache
-    if vectors_file:
-        import os
-        data_source = os.path.basename(vectors_file)
-        skip_if_exists = True
-    else:
-        data_source = None  # Random vectors - don't cache
-        skip_if_exists = False
+    import os
+    data_source = os.path.basename(vectors_file)
+    skip_if_exists = not force_reload  # Disable cache if force_reload is True
 
     # Main benchmark loop: iterate over dimensions
     for dim in dimensions:
@@ -155,12 +151,11 @@ def run_unified_benchmark(
         baseline_ids = baseline_ids_1024
 
         # Create unified table
-        # Only cache if using file-based vectors (random vectors are fast to regenerate)
         table = f"items_{dim}"
         if skip_if_exists:
             print(f"\n[Table] Checking/creating table: {table} (source: {data_source})")
         else:
-            print(f"\n[Table] Creating table: {table} (random vectors - always fresh)")
+            print(f"\n[Table] Force reloading table: {table} (source: {data_source})")
 
         create_and_insert_unified_table(
             conn,
@@ -180,6 +175,12 @@ def run_unified_benchmark(
         # Drop all existing indices to ensure clean benchmarking with current parameters
         print(f"[Index] Dropping all existing indices on {table}...")
         drop_all_indices_on_table(conn, table)
+
+        # Calculate storage sizes for this dimension
+        # Note: Binary quantization is part of the index, not stored separately
+        # Storage only reflects the full precision vectors (float32/float16)
+        storage_f32_mb = get_vector_storage_mb(num_vectors, dim, "float32")
+        storage_f16_mb = get_vector_storage_mb(num_vectors, dim, "float16")
 
         # Test each selected index type
         for index_type in selected_benchmarks:
@@ -211,13 +212,17 @@ def run_unified_benchmark(
                         unified_table=True,
                     )
 
+                    # Determine storage type and size
+                    storage_type = "float32" if prec == "f32" else "float16"
+                    storage_mb = storage_f32_mb if prec == "f32" else storage_f16_mb
+
                     results.append({
                         "dimension": dim,
+                        "storage": storage_type,
                         "index_type": index_type,
-                        "precision": prec,
-                        "variant": None,
                         "build_time_s": build_time,
                         "index_size_mb": idx_size,
+                        "storage_mb": storage_mb,
                         "query_latency_s": latency,
                         "recall": recall,
                     })
@@ -227,7 +232,7 @@ def run_unified_benchmark(
                 except Exception as e:
                     print(f"  ✗ Error: {e}")
 
-            # Test binary variants (mean, uint8, uint4)
+            # Test binary variants (mean, uint8, uint4) with both f32 and f16 reranking
             if config["binary"]:
                 for variant in config["variants"]:
                     variant_flags = {
@@ -236,64 +241,70 @@ def run_unified_benchmark(
                         "use_uint4_bin": variant == "uint4",
                     }
 
-                    print(f"\n[Index] Building {index_type} (binary-{variant})...")
-                    try:
-                        idx_name, build_time = build_index(
-                            conn, table, "f32", index_type, dim,
-                            unified_table=True,
-                            **variant_flags
-                        )
-                        idx_size = get_index_size_mb(conn, idx_name)
+                    # Test with both f32 and f16 reranking
+                    for prec in ["f32", "f16"]:
+                        storage_type = "float32" if prec == "f32" else "float16"
+                        storage_mb = storage_f32_mb if prec == "f32" else storage_f16_mb
+                        index_name = f"binary_{variant}_{index_type.replace('binary_', '').replace('_rerank', '')}_rerank"
 
-                        print(f"[Query] Testing {index_type} (binary-{variant})...")
-                        latency, recall = query_index(
-                            conn,
-                            table,
-                            "f32",  # Rerank using f32
-                            index_type,
-                            dim,
-                            query_trunc,
-                            baseline_ids,
-                            unified_table=True,
-                            dimension_means=dimension_means,
-                            uint8_thresholds=uint8_thresholds,
-                            uint4_thresholds=uint4_thresholds,
-                            **variant_flags
-                        )
+                        print(f"\n[Index] Building {index_name} ({prec})...")
+                        try:
+                            idx_name, build_time = build_index(
+                                conn, table, prec, index_type, dim,
+                                unified_table=True,
+                                **variant_flags
+                            )
+                            idx_size = get_index_size_mb(conn, idx_name)
 
-                        results.append({
-                            "dimension": dim,
-                            "index_type": index_type,
-                            "precision": "binary",
-                            "variant": variant,
-                            "build_time_s": build_time,
-                            "index_size_mb": idx_size,
-                            "query_latency_s": latency,
-                            "recall": recall,
-                        })
+                            print(f"[Query] Testing {index_name} ({prec})...")
+                            latency, recall = query_index(
+                                conn,
+                                table,
+                                prec,  # Rerank using specified precision
+                                index_type,
+                                dim,
+                                query_trunc,
+                                baseline_ids,
+                                unified_table=True,
+                                dimension_means=dimension_means,
+                                uint8_thresholds=uint8_thresholds,
+                                uint4_thresholds=uint4_thresholds,
+                                **variant_flags
+                            )
 
-                        print(f"  ✓ Recall: {recall*100:.1f}%, Latency: {latency*1000:.2f}ms, Size: {idx_size:.1f}MB")
+                            results.append({
+                                "dimension": dim,
+                                "storage": storage_type,
+                                "index_type": index_name,
+                                "build_time_s": build_time,
+                                "index_size_mb": idx_size,
+                                "storage_mb": storage_mb,
+                                "query_latency_s": latency,
+                                "recall": recall,
+                            })
 
-                    except Exception as e:
-                        print(f"  ✗ Error: {e}")
+                            print(f"  ✓ Recall: {recall*100:.1f}%, Latency: {latency*1000:.2f}ms, Size: {idx_size:.1f}MB")
 
-    # Print summary
-    print(f"\n{'='*60}")
-    print("BENCHMARK SUMMARY")
-    print(f"{'='*60}")
-    print(f"{'Dim':<6} {'Index':<15} {'Precision':<12} {'Variant':<8} {'Recall':<8} {'Latency(ms)':<12} {'Size(MB)':<10}")
-    print("-" * 80)
+                        except Exception as e:
+                            print(f"  ✗ Error: {e}")
+
+    # Print summary in markdown format
+    print("\n## BENCHMARK SUMMARY\n")
+
+    # Markdown table header
+    print("| Index | Recall (%) | Latency (ms) | Dim | Storage | Build (s) | Storage (MB) | Index (MB) |")
+    print("|-------|------------|--------------|-----|---------|-----------|--------------|------------|")
 
     for r in results:
-        variant_str = r["variant"] or "-"
         print(
-            f"{r['dimension']:<6} "
-            f"{r['index_type']:<15} "
-            f"{r['precision']:<12} "
-            f"{variant_str:<8} "
-            f"{r['recall']*100:>6.1f}% "
-            f"{r['query_latency_s']*1000:>10.2f} "
-            f"{r['index_size_mb']:>10.1f}"
+            f"| {r['index_type']} "
+            f"| {r['recall']*100:.1f} "
+            f"| {r['query_latency_s']*1000:.2f} "
+            f"| {r['dimension']} "
+            f"| {r['storage']} "
+            f"| {r['build_time_s']:.2f} "
+            f"| {r['storage_mb']:.1f} "
+            f"| {r['index_size_mb']:.1f} |"
         )
 
     conn.close()
@@ -311,6 +322,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vectors-file",
         type=str,
+        required=True,
         help="Path to .npy file with pre-generated vectors (e.g., instagram_vectors.npy)",
     )
     parser.add_argument(
@@ -331,6 +343,11 @@ if __name__ == "__main__":
         action="append",
         help=indexes_help,
     )
+    parser.add_argument(
+        "--force-reload",
+        action="store_true",
+        help="Force reload data even if tables exist (ignores cache)",
+    )
 
     args = parser.parse_args()
 
@@ -343,6 +360,7 @@ if __name__ == "__main__":
         dimensions=dims,
         selected_benchmarks=args.benchmark,
         vectors_file=args.vectors_file,
+        force_reload=args.force_reload,
     )
 
     print(f"\n[Complete] Tested {len(results)} configurations")
