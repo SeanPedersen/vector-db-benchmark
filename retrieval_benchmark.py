@@ -89,6 +89,12 @@ def main():
         default=100,
         help="Number of nearest neighbors to retrieve (default: 100)",
     )
+    # NEW: unified table mode
+    parser.add_argument(
+        "--unified",
+        action="store_true",
+        help="Use unified table structure with all precision columns (embedding_f32, embedding_f16)",
+    )
     # NEW: make IVFFlat params optional to enable auto-tuning
     parser.add_argument(
         "--ivf-lists",
@@ -198,6 +204,8 @@ def main():
     allowed_benchmarks = {
         "vchordrq",
         "ivfflat",
+        "hnsw",
+        "diskann",
         "binary-hnsw",
         "binary-ivf",
         "binary-exact",
@@ -553,20 +561,20 @@ def main():
         if "binary-hnsw" in benchmarks:
             print("[Index] Building HNSW binary (bit, float32 rerank) ...")
             idx_hnsw_bin, t_hnsw_bin = build_index(
-                conn, tbl_vector, "vector", "binary_hnsw", dim
+                conn, tbl_vector, "vector", "binary_hnsw_rerank", dim
             )
             print("[Index] Building HNSW binary (bit, float16 rerank) ...")
             idx_hnsw_bin_half, t_hnsw_bin_half = build_index(
-                conn, tbl_half, "halfvec", "binary_hnsw", dim
+                conn, tbl_half, "halfvec", "binary_hnsw_rerank", dim
             )
             if args.enable_mean_binarization:
                 print("[Index] Building HNSW binary MEAN (bit, float32 rerank) ...")
                 idx_hnsw_bin_mean, t_hnsw_bin_mean = build_index(
-                    conn, tbl_vector, "vector", "binary_hnsw", dim, use_mean_bin=True
+                    conn, tbl_vector, "vector", "binary_hnsw_rerank", dim, use_mean_bin=True
                 )
                 print("[Index] Building HNSW binary MEAN (bit, float16 rerank) ...")
                 idx_hnsw_bin_half_mean, t_hnsw_bin_half_mean = build_index(
-                    conn, tbl_half, "halfvec", "binary_hnsw", dim, use_mean_bin=True
+                    conn, tbl_half, "halfvec", "binary_hnsw_rerank", dim, use_mean_bin=True
                 )
             else:
                 idx_hnsw_bin_mean, t_hnsw_bin_mean = None, 0.0
@@ -574,11 +582,11 @@ def main():
             if args.enable_quasi_uint8:
                 print("[Index] Building HNSW binary UINT8 (bit, float32 rerank) ...")
                 idx_hnsw_bin_uint8, t_hnsw_bin_uint8 = build_index(
-                    conn, tbl_vector, "vector", "binary_hnsw", dim, use_uint8_bin=True
+                    conn, tbl_vector, "vector", "binary_hnsw_rerank", dim, use_uint8_bin=True
                 )
                 print("[Index] Building HNSW binary UINT8 (bit, float16 rerank) ...")
                 idx_hnsw_bin_half_uint8, t_hnsw_bin_half_uint8 = build_index(
-                    conn, tbl_half, "halfvec", "binary_hnsw", dim, use_uint8_bin=True
+                    conn, tbl_half, "halfvec", "binary_hnsw_rerank", dim, use_uint8_bin=True
                 )
             else:
                 idx_hnsw_bin_uint8, t_hnsw_bin_uint8 = None, 0.0
@@ -586,11 +594,11 @@ def main():
             if args.enable_quasi_uint4:
                 print("[Index] Building HNSW binary UINT4 (bit, float32 rerank) ...")
                 idx_hnsw_bin_uint4, t_hnsw_bin_uint4 = build_index(
-                    conn, tbl_vector, "vector", "binary_hnsw", dim, use_uint4_bin=True
+                    conn, tbl_vector, "vector", "binary_hnsw_rerank", dim, use_uint4_bin=True
                 )
                 print("[Index] Building HNSW binary UINT4 (bit, float16 rerank) ...")
                 idx_hnsw_bin_half_uint4, t_hnsw_bin_half_uint4 = build_index(
-                    conn, tbl_half, "halfvec", "binary_hnsw", dim, use_uint4_bin=True
+                    conn, tbl_half, "halfvec", "binary_hnsw_rerank", dim, use_uint4_bin=True
                 )
             else:
                 idx_hnsw_bin_uint4, t_hnsw_bin_uint4 = None, 0.0
@@ -611,26 +619,26 @@ def main():
                 f"[Index] Building IVFFlat binary (bit, float32 rerank, lists={IVF_LISTS}) ..."
             )
             idx_ivf_bin, t_ivf_bin = build_index(
-                conn, tbl_vector, "vector", "binary_ivf", dim
+                conn, tbl_vector, "vector", "binary_ivf_rerank", dim
             )
             print(
                 f"[Index] Building IVFFlat binary (bit, float16 rerank, lists={IVF_LISTS}) ..."
             )
             idx_ivf_bin_half, t_ivf_bin_half = build_index(
-                conn, tbl_half, "halfvec", "binary_ivf", dim
+                conn, tbl_half, "halfvec", "binary_ivf_rerank", dim
             )
             if args.enable_mean_binarization:
                 print(
                     f"[Index] Building IVFFlat binary MEAN (bit, float32 rerank, lists={IVF_LISTS}) ..."
                 )
                 idx_ivf_bin_mean, t_ivf_bin_mean = build_index(
-                    conn, tbl_vector, "vector", "binary_ivf", dim, use_mean_bin=True
+                    conn, tbl_vector, "vector", "binary_ivf_rerank", dim, use_mean_bin=True
                 )
                 print(
                     f"[Index] Building IVFFlat binary MEAN (bit, float16 rerank, lists={IVF_LISTS}) ..."
                 )
                 idx_ivf_bin_half_mean, t_ivf_bin_half_mean = build_index(
-                    conn, tbl_half, "halfvec", "binary_ivf", dim, use_mean_bin=True
+                    conn, tbl_half, "halfvec", "binary_ivf_rerank", dim, use_mean_bin=True
                 )
             else:
                 idx_ivf_bin_mean, t_ivf_bin_mean = None, 0.0
@@ -640,13 +648,13 @@ def main():
                     f"[Index] Building IVFFlat binary UINT8 (bit, float32 rerank, lists={IVF_LISTS}) ..."
                 )
                 idx_ivf_bin_uint8, t_ivf_bin_uint8 = build_index(
-                    conn, tbl_vector, "vector", "binary_ivf", dim, use_uint8_bin=True
+                    conn, tbl_vector, "vector", "binary_ivf_rerank", dim, use_uint8_bin=True
                 )
                 print(
                     f"[Index] Building IVFFlat binary UINT8 (bit, float16 rerank, lists={IVF_LISTS}) ..."
                 )
                 idx_ivf_bin_half_uint8, t_ivf_bin_half_uint8 = build_index(
-                    conn, tbl_half, "halfvec", "binary_ivf", dim, use_uint8_bin=True
+                    conn, tbl_half, "halfvec", "binary_ivf_rerank", dim, use_uint8_bin=True
                 )
             else:
                 idx_ivf_bin_uint8, t_ivf_bin_uint8 = None, 0.0
@@ -656,13 +664,13 @@ def main():
                     f"[Index] Building IVFFlat binary UINT4 (bit, float32 rerank, lists={IVF_LISTS}) ..."
                 )
                 idx_ivf_bin_uint4, t_ivf_bin_uint4 = build_index(
-                    conn, tbl_vector, "vector", "binary_ivf", dim, use_uint4_bin=True
+                    conn, tbl_vector, "vector", "binary_ivf_rerank", dim, use_uint4_bin=True
                 )
                 print(
                     f"[Index] Building IVFFlat binary UINT4 (bit, float16 rerank, lists={IVF_LISTS}) ..."
                 )
                 idx_ivf_bin_half_uint4, t_ivf_bin_half_uint4 = build_index(
-                    conn, tbl_half, "halfvec", "binary_ivf", dim, use_uint4_bin=True
+                    conn, tbl_half, "halfvec", "binary_ivf_rerank", dim, use_uint4_bin=True
                 )
             else:
                 idx_ivf_bin_uint4, t_ivf_bin_uint4 = None, 0.0
@@ -718,7 +726,7 @@ def main():
                 conn,
                 tbl_vector,
                 "vector",
-                "binary_hnsw",
+                "binary_hnsw_rerank",
                 dim,
                 query_trunc,
                 baseline_ids,
@@ -733,7 +741,7 @@ def main():
                 conn,
                 tbl_half,
                 "halfvec",
-                "binary_hnsw",
+                "binary_hnsw_rerank",
                 dim,
                 query_trunc,
                 baseline_ids,
@@ -749,7 +757,7 @@ def main():
                     conn,
                     tbl_vector,
                     "vector",
-                    "binary_hnsw",
+                    "binary_hnsw_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -766,7 +774,7 @@ def main():
                     conn,
                     tbl_half,
                     "halfvec",
-                    "binary_hnsw",
+                    "binary_hnsw_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -786,7 +794,7 @@ def main():
                     conn,
                     tbl_vector,
                     "vector",
-                    "binary_hnsw",
+                    "binary_hnsw_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -803,7 +811,7 @@ def main():
                     conn,
                     tbl_half,
                     "halfvec",
-                    "binary_hnsw",
+                    "binary_hnsw_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -823,7 +831,7 @@ def main():
                     conn,
                     tbl_vector,
                     "vector",
-                    "binary_hnsw",
+                    "binary_hnsw_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -840,7 +848,7 @@ def main():
                     conn,
                     tbl_half,
                     "halfvec",
-                    "binary_hnsw",
+                    "binary_hnsw_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -861,7 +869,7 @@ def main():
                 conn,
                 tbl_vector,
                 "vector",
-                "binary_ivf",
+                "binary_ivf_rerank",
                 dim,
                 query_trunc,
                 baseline_ids,
@@ -876,7 +884,7 @@ def main():
                 conn,
                 tbl_half,
                 "halfvec",
-                "binary_ivf",
+                "binary_ivf_rerank",
                 dim,
                 query_trunc,
                 baseline_ids,
@@ -892,7 +900,7 @@ def main():
                     conn,
                     tbl_vector,
                     "vector",
-                    "binary_ivf",
+                    "binary_ivf_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -909,7 +917,7 @@ def main():
                     conn,
                     tbl_half,
                     "halfvec",
-                    "binary_ivf",
+                    "binary_ivf_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -927,7 +935,7 @@ def main():
                     conn,
                     tbl_vector,
                     "vector",
-                    "binary_ivf",
+                    "binary_ivf_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -944,7 +952,7 @@ def main():
                     conn,
                     tbl_half,
                     "halfvec",
-                    "binary_ivf",
+                    "binary_ivf_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -964,7 +972,7 @@ def main():
                     conn,
                     tbl_vector,
                     "vector",
-                    "binary_ivf",
+                    "binary_ivf_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -981,7 +989,7 @@ def main():
                     conn,
                     tbl_half,
                     "halfvec",
-                    "binary_ivf",
+                    "binary_ivf_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -1003,7 +1011,7 @@ def main():
                 conn,
                 tbl_vector,
                 "vector",
-                "binary_exact",
+                "binary_exact_rerank",
                 dim,
                 query_trunc,
                 baseline_ids,
@@ -1015,7 +1023,7 @@ def main():
                 conn,
                 tbl_half,
                 "halfvec",
-                "binary_exact",
+                "binary_exact_rerank",
                 dim,
                 query_trunc,
                 baseline_ids,
@@ -1052,7 +1060,7 @@ def main():
                     conn,
                     tbl_vector,
                     "vector",
-                    "binary_exact",
+                    "binary_exact_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,
@@ -1066,7 +1074,7 @@ def main():
                     conn,
                     tbl_half,
                     "halfvec",
-                    "binary_exact",
+                    "binary_exact_rerank",
                     dim,
                     query_trunc,
                     baseline_ids,

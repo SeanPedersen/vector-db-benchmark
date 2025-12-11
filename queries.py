@@ -37,14 +37,15 @@ def query_index(
     uint8_thresholds=None,
     use_uint4_bin=False,
     uint4_thresholds=None,
+    unified_table=False,
 ):
     """Execute a query against the specified index and return latency and recall.
 
     Args:
         conn: Database connection
         table: Table name
-        precision: "vector" or "halfvec"
-        kind: Index type ("ivf", "binary_hnsw", "binary_ivf", "binary_exact", "exact", "vchordrq")
+        precision: "vector"/"halfvec" for old tables, "f32"/"f16" for unified tables
+        kind: Index type ("ivf", "hnsw", "diskann", "binary_hnsw_rerank", "binary_ivf_rerank", "binary_exact_rerank", "exact", "vchordrq")
         dim: Number of dimensions
         query_vec: Query vector
         baseline_ids: Baseline (ground truth) IDs for recall calculation
@@ -57,11 +58,27 @@ def query_index(
         uint8_thresholds: Thresholds for uint8 encoding
         use_uint4_bin: Use uint4-style binarization
         uint4_thresholds: Thresholds for uint4 encoding
+        unified_table: Whether this is a unified table with embedding_f32/embedding_f16 columns
 
     Returns:
         Tuple of (latency, recall)
     """
     cursor = conn.cursor()
+
+    # Map precision identifiers for unified tables
+    if unified_table:
+        if precision == "f32":
+            cast_type = "vector"
+            emb_col = "embedding_f32"
+        elif precision == "f16":
+            cast_type = "halfvec"
+            emb_col = "embedding_f16"
+        else:
+            raise ValueError(f"Unknown precision for unified table: {precision}")
+    else:
+        # Old-style table with single "embedding" column
+        emb_col = "embedding"
+        cast_type = precision
     # Prepare query textual forms
     query_list_full = query_vec[:dim].tolist()
     query_txt = "[" + ",".join(map(str, query_list_full)) + "]"
@@ -90,24 +107,23 @@ def query_index(
     if kind == "ivf":
         # Set probes for IVFFlat
         cursor.execute(f"SET ivfflat.probes = {IVF_PROBES}")
-        cast_type = "vector" if precision == "vector" else "halfvec"
         # Warm-up
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            f"SELECT id FROM {table} ORDER BY {emb_col} <=> %s::{cast_type} LIMIT {K}",
             (query_txt,),
         )
         cursor.fetchall()
         start = time.time()
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            f"SELECT id FROM {table} ORDER BY {emb_col} <=> %s::{cast_type} LIMIT {K}",
             (query_txt,),
         )
         rows = cursor.fetchall()
         retrieved = [r[0] for r in rows]
         latency = time.time() - start
     elif kind in (
-        "binary_hnsw",
-        "binary_ivf",
+        "binary_hnsw_rerank",
+        "binary_ivf_rerank",
     ):
         # Use binary index for candidate generation, SQL for rerank (no Python NumPy).
         overfetch = K * OVERFETCH_FACTOR
@@ -117,8 +133,6 @@ def query_index(
         else:
             eff = min(max(HNSW_EF_SEARCH, overfetch), HNSW_EF_SEARCH_MAX)
             cursor.execute(f"SET hnsw.ef_search = {eff}")
-
-        cast_type = "vector" if precision == "vector" else "halfvec"
 
         # Choose binary column and query based on binarization flags (priority: uint8 > uint4 > mean > default)
         if use_uint8_bin:
@@ -136,7 +150,7 @@ def query_index(
               LIMIT {overfetch}
             ) c
             JOIN {table} t USING(id)
-            ORDER BY t.embedding <=> %s::{cast_type}
+            ORDER BY t.{emb_col} <=> %s::{cast_type}
             LIMIT {K}
             """
             # Warm-up
@@ -174,7 +188,7 @@ def query_index(
               LIMIT {overfetch}
             ) c
             JOIN {table} t USING(id)
-            ORDER BY t.embedding <=> %s::{cast_type}
+            ORDER BY t.{emb_col} <=> %s::{cast_type}
             LIMIT {K}
             """
             # Warm-up
@@ -211,7 +225,7 @@ def query_index(
               LIMIT {overfetch}
             ) c
             JOIN {table} t USING(id)
-            ORDER BY t.embedding <=> %s::{cast_type}
+            ORDER BY t.{emb_col} <=> %s::{cast_type}
             LIMIT {K}
             """
             # Warm-up
@@ -245,7 +259,7 @@ def query_index(
               LIMIT {overfetch}
             ) c
             JOIN {table} t USING(id)
-            ORDER BY t.embedding <=> %s::{cast_type}
+            ORDER BY t.{emb_col} <=> %s::{cast_type}
             LIMIT {K}
             """
             # Warm-up
@@ -266,10 +280,9 @@ def query_index(
             rows = cursor.fetchall()
             retrieved = [int(r[0]) for r in rows]
             latency = time.time() - start
-    elif kind in ("binary_exact", "binary_exact_k"):
+    elif kind in ("binary_exact_rerank", "binary_exact_k"):
         # Exact binary candidate generation (no index). For _k: no rerank to measure pure Hamming scan speed.
         overfetch = K if kind.endswith("_k") else K * OVERFETCH_FACTOR
-        cast_type = "vector" if precision == "vector" else "halfvec"
 
         if use_uint8_bin:
             bin_col = "embedding_bin_uint8"
@@ -295,7 +308,7 @@ def query_index(
                   LIMIT {overfetch}
                 ) c
                 JOIN {table} t USING(id)
-                ORDER BY t.embedding <=> %s::{cast_type}
+                ORDER BY t.{emb_col} <=> %s::{cast_type}
                 LIMIT {K}
                 """
                 params = (query_bin_str, query_txt)
@@ -323,7 +336,7 @@ def query_index(
                   LIMIT {overfetch}
                 ) c
                 JOIN {table} t USING(id)
-                ORDER BY t.embedding <=> %s::{cast_type}
+                ORDER BY t.{emb_col} <=> %s::{cast_type}
                 LIMIT {K}
                 """
                 params = (query_bin_str, query_txt)
@@ -350,7 +363,7 @@ def query_index(
                   LIMIT {overfetch}
                 ) c
                 JOIN {table} t USING(id)
-                ORDER BY t.embedding <=> %s::{cast_type}
+                ORDER BY t.{emb_col} <=> %s::{cast_type}
                 LIMIT {K}
                 """
                 params = (query_bin_str, query_txt)
@@ -375,7 +388,7 @@ def query_index(
                   LIMIT {overfetch}
                 ) c
                 JOIN {table} t USING(id)
-                ORDER BY t.embedding <=> %s::{cast_type}
+                ORDER BY t.{emb_col} <=> %s::{cast_type}
                 LIMIT {K}
                 """
                 params = (query_txt, query_txt)
@@ -411,8 +424,7 @@ def query_index(
             cursor.execute("SET enable_indexonlyscan = off")
             cursor.execute("SET enable_seqscan = on")
 
-            cast_type = "vector" if precision == "vector" else "halfvec"
-            sql = f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}"
+            sql = f"SELECT id FROM {table} ORDER BY {emb_col} <=> %s::{cast_type} LIMIT {K}"
 
             # Warm-up
             cursor.execute(sql, (query_txt,))
@@ -441,20 +453,39 @@ def query_index(
                 cursor.execute("SET enable_seqscan = on")
             except Exception:
                 pass
-    else:
-        # VectorChord vchordrq - set RaBitQ epsilon and probes
-        cursor.execute(f"SET vchordrq.epsilon = {VCHORDRQ_EPSILON}")
-        cursor.execute(f"SET vchordrq.probes = {VCHORDRQ_PROBES}")
+    elif kind in ("hnsw", "diskann"):
+        # HNSW or DiskANN index query
+        if kind == "hnsw":
+            eff = min(max(HNSW_EF_SEARCH, K), HNSW_EF_SEARCH_MAX)
+            cursor.execute(f"SET hnsw.ef_search = {eff}")
+
         # Warm-up
-        cast_type = "vector" if precision == "vector" else "halfvec"
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            f"SELECT id FROM {table} ORDER BY {emb_col} <=> %s::{cast_type} LIMIT {K}",
             (query_txt,),
         )
         cursor.fetchall()
         start = time.time()
         cursor.execute(
-            f"SELECT id FROM {table} ORDER BY embedding <=> %s::{cast_type} LIMIT {K}",
+            f"SELECT id FROM {table} ORDER BY {emb_col} <=> %s::{cast_type} LIMIT {K}",
+            (query_txt,),
+        )
+        rows = cursor.fetchall()
+        retrieved = [r[0] for r in rows]
+        latency = time.time() - start
+    else:
+        # VectorChord vchordrq - set RaBitQ epsilon and probes
+        cursor.execute(f"SET vchordrq.epsilon = {VCHORDRQ_EPSILON}")
+        cursor.execute(f"SET vchordrq.probes = {VCHORDRQ_PROBES}")
+        # Warm-up
+        cursor.execute(
+            f"SELECT id FROM {table} ORDER BY {emb_col} <=> %s::{cast_type} LIMIT {K}",
+            (query_txt,),
+        )
+        cursor.fetchall()
+        start = time.time()
+        cursor.execute(
+            f"SELECT id FROM {table} ORDER BY {emb_col} <=> %s::{cast_type} LIMIT {K}",
             (query_txt,),
         )
         rows = cursor.fetchall()

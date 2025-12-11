@@ -1,6 +1,9 @@
 services:
   postgres_db:
-    image: timescale/timescaledb-ha:pg17
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vector-benchmark-complete:latest
     command: [
       "postgres",
       "-c", "shared_preload_libraries=timescaledb,vchord",

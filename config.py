@@ -32,5 +32,50 @@ HNSW_EF_SEARCH_MAX = 1000  # Upper cap for hnsw.ef_search to satisfy server limi
 VCHORDRQ_EPSILON = 1.9  # RaBitQ epsilon (range: 0.0-4.0; higher = more accurate, slower)
 VCHORDRQ_BUILD_THREADS = 8  # Build threads for K-means clustering (range: 1-255)
 VCHORDRQ_LISTS = 1000  # Number of clusters for vchordrq index
-VCHORDRQ_PROBES = 10  # Number of clusters to search (higher = better recall, slower)
+VCHORDRQ_PROBES = 100  # Number of clusters to search (higher = better recall, slower)
 VCHORDRQ_SPHERICAL_CENTROIDS = True  # Enable spherical centroids (recommended with cosine similarity)
+
+# Index configuration matrix - defines which data types each index supports
+INDEX_CONFIGS = {
+    "vchordrq": {
+        "precisions": ["f32", "f16"],
+        "binary": False,
+    },
+    "ivfflat": {
+        "precisions": ["f32", "f16"],
+        "binary": False,
+    },
+    "diskann": {
+        "precisions": ["f32", "f16"],
+        "binary": False,
+    },
+    "hnsw": {
+        "precisions": ["f32", "f16"],
+        "binary": False,
+    },
+    "binary_hnsw_rerank": {
+        "precisions": [],
+        "binary": True,
+        "variants": ["mean", "uint8", "uint4"],
+    },
+    "binary_ivf_rerank": {
+        "precisions": [],
+        "binary": True,
+        "variants": ["mean", "uint8", "uint4"],
+    },
+    "exact": {
+        "precisions": ["f32", "f16"],
+        "binary": False,
+    },
+    "binary_exact_rerank": {
+        "precisions": [],
+        "binary": True,
+        "variants": ["mean", "uint8", "uint4"],
+    },
+}
+
+# Precision mappings
+PRECISION_TYPES = {
+    "f32": "vector",
+    "f16": "halfvec",
+}
